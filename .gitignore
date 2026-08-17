@@ -1,0 +1,28 @@
+# Raw dataset (images, embeddings cache, source archives)
+FOR_TRAINNING/
+FOR_TRAINNING-*.zip
+*:Zone.Identifier
+
+# Model checkpoints / exported weights
+*.pth
+*.onnx
+
+# Generated outputs / loose images
+gradcam_out/
+misclassified/
+prediction_result.png
+*.jpg
+*.jpeg
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Docs — keep only README.md, working notes stay local
+*.md
+!README.md

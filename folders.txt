@@ -1,0 +1,52 @@
+01_Augustus
+02_Tiberius
+03_Caligula
+04_Claudius
+05_Nero
+06_Galba
+07_Otho
+08_Vitellius
+09_Vespasian
+10_Titus
+11_Domitian
+12_Nerva
+13_Trajan
+14_Hadrian
+15_Antoninus Pius
+16_Marcus Aurelius
+17_Lucius Verus
+18_Commodus
+19_Pertinax
+20_Didius Julianus
+21_Septimius Severus
+22_Caracalla
+23_Geta
+24_Macrinus
+25_Elagabalus
+26_Severus Alexander
+27_Maximinus Thrax
+28_Gordian I
+29_Gordian II
+30_Pupienus
+31_Balbinus
+32_Gordian III
+33_Philip the Arab
+34_Trajan Decius
+36_Trebonianus Gallus
+37_Aemilian
+38_Valerian
+39_Gallienus
+40_Claudius Gothicus
+41_Quintillus
+42_Aurelian
+43_Tacitus
+44_Florianus
+45_Probus
+46_Carus
+47_Numerian
+48_Carinus
+49_Diocletian
+50_Maximian
+51_Constantius_I
+52_Galerius
+53_Severus II
