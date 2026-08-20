@@ -22,9 +22,7 @@ RUN pip install --no-cache-dir \
     && pip install --no-cache-dir -r requirements-serve.txt
 
 COPY app/ app/
-COPY emp_model_distil_student.pth .
 
-ENV CHECKPOINT_PATH=/srv/emp_model_distil_student.pth
 ENV LABELS_PATH=/srv/app/coin_labels.json
 
 EXPOSE 8000

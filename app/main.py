@@ -1,31 +1,37 @@
 """FastAPI server for the distilled coin classifier.
 
-Model: emp_model_distil_student.pth — MobileNetV3-Large distilled from the v6
-ensemble teacher (92.71% test acc), 89.61% test acc as a single forward pass.
-Preprocessing mirrors gradcam.py / emp_model_knowledge_distilation.ipynb's
-val_transform: Resize(256) -> CenterCrop(224) -> ImageNet normalize.
+Model source: the current @champion in the MLflow registry
+(models:/coin-classifier@champion), loaded at startup — no baked-in checkpoint.
+Because the full model was logged (not just weights), no architecture-rebuild code
+is needed here; mlflow.pytorch.load_model reconstructs the nn.Module directly.
+
+Preprocessing mirrors val_transform: Resize(256) -> CenterCrop(224) -> ImageNet normalize.
 
 Endpoints:
-    GET  /health   liveness + model info
-    POST /predict  multipart image upload -> top-k emperor predictions
+    GET  /health   liveness + model info (incl. model_version)
+    POST /predict  multipart image upload -> top-k predictions (incl. model_version)
 """
 import io
 import json
 import os
 from pathlib import Path
 
+import mlflow
+import mlflow.pytorch
 import torch
 import torch.nn as nn
-import torchvision.models as tvm
 import torchvision.transforms as T
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 APP_DIR = Path(__file__).resolve().parent
-CHECKPOINT_PATH = Path(os.environ.get("CHECKPOINT_PATH", APP_DIR.parent / "emp_model_distil_student.pth"))
 LABELS_PATH = Path(os.environ.get("LABELS_PATH", APP_DIR / "coin_labels.json"))
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+MODEL_NAME = os.environ.get("MODEL_NAME", "coin-classifier")
+MODEL_ALIAS = os.environ.get("MODEL_ALIAS", "champion")
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -45,20 +51,18 @@ def load_labels(path: Path) -> dict[int, str]:
     return {int(k): v for k, v in raw.items()}
 
 
-def load_model(checkpoint_path: Path, num_classes: int, device: torch.device) -> nn.Module:
-    if not checkpoint_path.is_file():
-        raise RuntimeError(f"Checkpoint not found: {checkpoint_path}")
-    model = tvm.mobilenet_v3_large(weights=None)
-    in_features = model.classifier[3].in_features
-    model.classifier[3] = nn.Linear(in_features, num_classes)
-    state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state)
+def load_model_from_registry(
+    tracking_uri: str, model_name: str, model_alias: str, device: torch.device
+) -> tuple[nn.Module, str]:
+    mlflow.set_tracking_uri(tracking_uri)
+    version = mlflow.MlflowClient().get_model_version_by_alias(model_name, model_alias).version
+    model = mlflow.pytorch.load_model(f"models:/{model_name}@{model_alias}")
     model.to(device).eval()
-    return model
+    return model, version
 
 
 idx_to_name = load_labels(LABELS_PATH)
-model = load_model(CHECKPOINT_PATH, len(idx_to_name), DEVICE)
+model, MODEL_VERSION = load_model_from_registry(MLFLOW_TRACKING_URI, MODEL_NAME, MODEL_ALIAS, DEVICE)
 
 app = FastAPI(title="Coin Classifier", description="Roman emperor coin classifier (MobileNetV3-Large, distilled)")
 
@@ -69,14 +73,18 @@ class Prediction(BaseModel):
 
 
 class PredictResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())  # allow the model_version field name
+    model_version: str
     predictions: list[Prediction]
 
 
 class HealthResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     status: str
     device: str
     num_classes: int
-    checkpoint: str
+    model_name: str
+    model_version: str
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -85,7 +93,8 @@ def health() -> HealthResponse:
         status="ok",
         device=str(DEVICE),
         num_classes=len(idx_to_name),
-        checkpoint=CHECKPOINT_PATH.name,
+        model_name=MODEL_NAME,
+        model_version=MODEL_VERSION,
     )
 
 
@@ -112,4 +121,4 @@ async def predict(file: UploadFile = File(...), topk: int = 3) -> PredictRespons
         Prediction(label=idx_to_name[int(idx)], probability=float(p))
         for p, idx in zip(top_p[0].tolist(), top_i[0].tolist())
     ]
-    return PredictResponse(predictions=predictions)
+    return PredictResponse(model_version=MODEL_VERSION, predictions=predictions)

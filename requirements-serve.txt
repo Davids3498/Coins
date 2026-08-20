@@ -3,3 +3,5 @@ uvicorn[standard]==0.34.0
 pillow==10.2.0
 python-multipart==0.0.20
 numpy==1.26.4
+mlflow
+boto3
