@@ -1,19 +1,26 @@
-# Raw dataset (images, embeddings cache, source archives)
-FOR_TRAINNING/
-FOR_TRAINNING-*.zip
-*:Zone.Identifier
+# Raw dataset (images, embeddings cache, source archives) + root compat symlink
+FOR_TRAINNING
+data/
 
 # Model checkpoints / exported weights
+weights/
 *.pth
 *.onnx
 
 # Generated outputs / loose images
-gradcam_out/
-misclassified/
+outputs/
+misclassified
 prediction_result.png
 *.jpg
 *.jpeg
 *.png
+
+# MLflow local tracking store
+mlflow.db
+
+# Scratch / throwaway files
+scratch/
+misc/
 
 # Python
 __pycache__/

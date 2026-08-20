@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset
 
 
 DEFAULT_DATA_DIR = '/home/david/coin/FOR_TRAINNING'
-DEFAULT_CHECKPOINT = '/home/david/coin/emp_model_v2_merged_head_best.pth'
+DEFAULT_CHECKPOINT = '/home/david/coin/weights/emp_model_v2_merged_head_best.pth'
 
 # Must stay in sync with MERGES in emp_model_v2_merged.ipynb.
 # Only applied when the checkpoint's output dim < original class count.

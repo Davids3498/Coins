@@ -28,9 +28,9 @@ import torchvision.transforms as T
 from PIL import Image
 from matplotlib import cm
 
-DEFAULT_CHECKPOINT = '/home/david/coin/emp_model_distil_student.pth'
+DEFAULT_CHECKPOINT = '/home/david/coin/weights/emp_model_distil_student.pth'
 DEFAULT_DATA_DIR = '/home/david/coin/FOR_TRAINNING'
-DEFAULT_OUT_DIR = '/home/david/coin/gradcam_out'
+DEFAULT_OUT_DIR = '/home/david/coin/outputs/gradcam_out'
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]

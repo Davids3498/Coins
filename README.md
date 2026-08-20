@@ -20,7 +20,7 @@ deployable model via knowledge distillation.
 | `emp_model_knowledge_distilation.ipynb` | MobileNetV3-Large distilled from the v6 ensemble | 89.61% |
 | `emp_model_mobilenet_baseline.ipynb` | Same MobileNetV3, plain CE (no distillation) — comparison | 89.02% |
 
-Full write-up of what worked and what didn't is in `improvement_or_not.md`
+Full write-up of what worked and what didn't is in `docs/improvement_or_not.md`
 (kept locally, not pushed).
 
 v6 has the best raw accuracy but is an ensemble + kNN + sub-classifier
@@ -69,15 +69,41 @@ pip install -r requirements-serve.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+## Layout
+
+```
+app/          FastAPI serving app (main.py, coin_labels.json)
+notebooks/    all model-development notebooks (emp_model_v2..v7, distillation, gradcam, predict, seed_champion, ...)
+scripts/      train.py, prepare.py, predict.py, gradcam.py, download.py, seed_champion.py
+weights/      all .pth checkpoints — gitignored
+docs/         working notes (improvement_or_not.md, notebook_summary.md, ...) — gitignored, local only
+data/         FOR_TRAINNING/ dataset + source zip archives — gitignored
+mlflow/       local MLflow tracking store (mlflow.db) — gitignored
+outputs/      generated artifacts (gradcam_out/, misclassified/, prediction_result.png) — gitignored
+scratch/      throwaway smoke-test files — gitignored
+misc/         loose non-project images — gitignored
+```
+
+Every notebook uses **absolute paths** (`/home/david/coin/FOR_TRAINNING`,
+`/home/david/coin/weights/emp_model_*.pth`) rather than paths relative to
+the notebook's own location — this matters because VS Code's Jupyter
+extension sets a notebook's `cwd` to wherever the `.ipynb` file lives, so a
+bare relative filename would silently break the moment the notebook moved
+into `notebooks/`. All checkpoint load/save cells and `predict.ipynb`'s
+`prediction_result.png` output were updated to absolute paths as part of
+this move. `FOR_TRAINNING` and a couple of other generated-output paths
+also have compatibility symlinks at repo root pointing into `data/`/`outputs/`.
+
 ## Other scripts
 
-- `train.py` / `prepare.py` — training entrypoint and fixed data/model infra (embeddings, splits, `CoinHead`).
-- `predict.py` — batch CLI inference over a directory of images using a checkpoint.
-- `gradcam.py` — Grad-CAM visualization for the distilled student, to sanity-check what pixels drive a prediction.
-- `download.py` — fetches the training dataset.
+- `scripts/train.py` / `scripts/prepare.py` — training entrypoint and fixed data/model infra (embeddings, splits, `CoinHead`).
+- `scripts/predict.py` — batch CLI inference over a directory of images using a checkpoint.
+- `scripts/gradcam.py` — Grad-CAM visualization for the distilled student, to sanity-check what pixels drive a prediction.
+- `scripts/download.py` — fetches the training dataset.
+- `scripts/seed_champion.py` — registers a checkpoint as the `@champion` model in the MLflow registry.
 
 ## Data & weights
 
-The training dataset (`FOR_TRAINNING/`) and all `.pth`/`.onnx` checkpoints are
-gitignored — too large for the repo. Only notebooks, source files, and this
-README are tracked.
+The training dataset (`data/FOR_TRAINNING/`) and all `.pth`/`.onnx`
+checkpoints (`weights/`) are gitignored — too large for the repo. Only
+notebooks, source files, and this README are tracked.
