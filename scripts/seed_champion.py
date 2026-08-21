@@ -8,9 +8,9 @@ from __future__ import annotations
 import mlflow
 import mlflow.pytorch
 import torch
-import torch.nn as nn
-import torchvision.models as tvm
 from mlflow.models import infer_signature
+
+from coin_clf.model import build_model
 
 # --- edit these ---
 CHECKPOINT_PATH: str = "path/to/your.pth"      # your fine-tuned state dict
@@ -22,13 +22,6 @@ MODEL_NAME: str = "coin-classifier"
 EXPERIMENT_NAME: str = "coin-classifier"
 NUM_CLASSES: int = 51
 ARCH: str = "mobilenet_v3_large"
-
-
-def build_model(num_classes: int) -> nn.Module:
-    model = tvm.mobilenet_v3_large(weights=None)  # weights=None: the state dict overwrites everything anyway
-    in_features = model.classifier[3].in_features
-    model.classifier[3] = nn.Linear(in_features, num_classes)
-    return model
 
 
 def main() -> None:

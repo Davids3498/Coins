@@ -1,0 +1,12 @@
+# .dockerignore
+data/
+datasets/
+*.jpg
+*.png
+*.jpeg
+mlruns/
+mlartifacts/
+.git/
+__pycache__/
+*.pyc
+.venv/

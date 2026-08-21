@@ -21,6 +21,14 @@ RUN pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements-serve.txt
 
+# coin_clf: shared model/transform code, installed before app/ so `import coin_clf`
+# works at startup. --no-deps: torch/torchvision are already pinned above (CPU
+# wheels); letting pip re-resolve coin_clf's deps from PyPI could pull in GPU
+# wheels or drift the pinned versions.
+COPY pyproject.toml .
+COPY src/ src/
+RUN pip install --no-cache-dir --no-deps .
+
 COPY app/ app/
 
 ENV LABELS_PATH=/srv/app/coin_labels.json

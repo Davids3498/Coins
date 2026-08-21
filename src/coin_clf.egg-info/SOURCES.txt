@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/coin_clf/__init__.py
+src/coin_clf/data.py
+src/coin_clf/labels.py
+src/coin_clf/model.py
+src/coin_clf/teacher.py
+src/coin_clf/transforms.py
+src/coin_clf.egg-info/PKG-INFO
+src/coin_clf.egg-info/SOURCES.txt
+src/coin_clf.egg-info/dependency_links.txt
+src/coin_clf.egg-info/requires.txt
+src/coin_clf.egg-info/top_level.txt

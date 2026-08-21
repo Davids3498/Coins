@@ -5,14 +5,13 @@ Model source: the current @champion in the MLflow registry
 Because the full model was logged (not just weights), no architecture-rebuild code
 is needed here; mlflow.pytorch.load_model reconstructs the nn.Module directly.
 
-Preprocessing mirrors val_transform: Resize(256) -> CenterCrop(224) -> ImageNet normalize.
+Preprocessing uses coin_clf.transforms.val_transform: Resize(256) -> CenterCrop(224) -> ImageNet normalize.
 
 Endpoints:
     GET  /health   liveness + model info (incl. model_version)
     POST /predict  multipart image upload -> top-k predictions (incl. model_version)
 """
 import io
-import json
 import os
 from pathlib import Path
 
@@ -20,10 +19,12 @@ import mlflow
 import mlflow.pytorch
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict
+
+from coin_clf.labels import load_labels
+from coin_clf.transforms import val_transform as preprocess
 
 APP_DIR = Path(__file__).resolve().parent
 LABELS_PATH = Path(os.environ.get("LABELS_PATH", APP_DIR / "coin_labels.json"))
@@ -32,23 +33,6 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 MODEL_NAME = os.environ.get("MODEL_NAME", "coin-classifier")
 MODEL_ALIAS = os.environ.get("MODEL_ALIAS", "champion")
-
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
-
-preprocess = T.Compose([
-    T.Resize(256),
-    T.CenterCrop(224),
-    T.ToTensor(),
-    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-])
-
-
-def load_labels(path: Path) -> dict[int, str]:
-    if not path.is_file():
-        raise RuntimeError(f"Label file not found: {path}")
-    raw = json.loads(path.read_text())
-    return {int(k): v for k, v in raw.items()}
 
 
 def load_model_from_registry(
