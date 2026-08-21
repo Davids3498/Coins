@@ -33,3 +33,5 @@ __pycache__/
 # Docs — keep only README.md, working notes stay local
 *.md
 !README.md
+
+makefile

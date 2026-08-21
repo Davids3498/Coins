@@ -7,6 +7,8 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, WeightedRandomSampler
 
+from coin_clf.transforms import val_transform
+
 GORDIAN_MERGES = {"GORDIAN II": "GORDIAN I"}
 
 
@@ -74,6 +76,33 @@ class CoinDistilDataset(Dataset):
         soft = self.teacher_soft[idx]  # (num_classes,) float
         hard = self.all_labs[idx]      # int
         return img_tensor, soft, hard
+
+
+class CoinEvalDataset(Dataset):
+    """Returns (image, label) — no teacher soft labels, for eval/serving-parity scoring."""
+
+    def __init__(self, filepaths, all_labs, indices, transform):
+        self.filepaths = filepaths
+        self.all_labs = all_labs
+        self.indices = indices
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        idx = self.indices[i]
+        img = Image.open(self.filepaths[idx]).convert("RGB")
+        return self.transform(img), self.all_labs[idx]
+
+
+def build_test_dataset(data_dir: Path, test_size: float = 0.2, random_state: int = 42) -> Dataset:
+    """The frozen test split, transformed the way serving transforms images. The one seam
+    evaluate.py needs to score any registered version without reproducing the split logic.
+    """
+    filepaths, all_labs, *_ = discover_dataset(data_dir)
+    _, _, test_idx = split_dataset(all_labs, test_size=test_size, random_state=random_state)
+    return CoinEvalDataset(filepaths, all_labs, test_idx, val_transform)
 
 
 def class_balanced_weights(labels: torch.Tensor, num_classes: int, beta: float = 0.9999) -> torch.Tensor:

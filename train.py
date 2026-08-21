@@ -35,6 +35,7 @@ from coin_clf.labels import save_labels
 from coin_clf.model import build_model
 from coin_clf.teacher import CoinHeadV6, SubHead
 from coin_clf.transforms import train_transform, val_transform
+from checkpoint import save_checkpoint
 
 EXPERIMENT_NAME = "coin-classifier"
 MODEL_NAME = "coin-classifier"
@@ -47,8 +48,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dir", default="/home/david/coin/FOR_TRAINNING")
     p.add_argument("--weights-dir", default="/home/david/coin/weights")
-    p.add_argument("--student-ckpt-out", default=None,
-                    help="default: <weights-dir>/emp_model_distil_student.pth")
     p.add_argument("--labels-out", default=None,
                     help="default: <weights-dir>/coin_labels.json")
     p.add_argument("--num-classes", type=int, default=51)
@@ -67,8 +66,6 @@ def parse_args() -> argparse.Namespace:
                     help="v6 full-pipeline test accuracy, used for the compression-gap metric")
     p.add_argument("--tracking-uri", default="http://127.0.0.1:5000")
     args = p.parse_args()
-    if args.student_ckpt_out is None:
-        args.student_ckpt_out = str(Path(args.weights_dir) / "emp_model_distil_student.pth")
     if args.labels_out is None:
         args.labels_out = str(Path(args.weights_dir) / "coin_labels.json")
     return args
@@ -258,7 +255,7 @@ def main() -> None:
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    with mlflow.start_run(run_name="distill-mobilenetv3"):
+    with mlflow.start_run(run_name="distill-mobilenetv3") as run:
         mlflow.log_params({
             "arch": "mobilenet_v3_large",
             "pretrained": True,
@@ -315,10 +312,8 @@ def main() -> None:
 
         model.load_state_dict(best_state)
         model.eval()
-        Path(args.student_ckpt_out).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), args.student_ckpt_out)
-        print(f"Saved student weights -> {args.student_ckpt_out}")
-
+        ckpt_path = save_checkpoint(best_state, args.weights_dir, run.info.run_id)
+        print(f"Saved student weights -> {ckpt_path}")
         test_acc = evaluate_hard(model, test_loader, device)
         compression_gap_pp = (args.teacher_test_acc - test_acc) * 100
         print(f"Best val acc: {best_val_acc:.4f}  Test acc: {test_acc:.4f}  "
