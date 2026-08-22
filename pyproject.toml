@@ -12,6 +12,7 @@ dependencies = [
     "torchvision",
     "pillow",
     "numpy",
+    "pandas",
     "scikit-learn",
 ]
 

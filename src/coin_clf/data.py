@@ -16,13 +16,22 @@ def folder_label(name: str) -> str:
     return re.sub(r"^\d+_", "", name)
 
 
-def discover_dataset(data_dir: Path):
+def discover_dataset(data_dir: Path, clean_list: Path | str | None = None):
     """Glob the labeled image tree, encode labels, and apply the GORDIAN II -> GORDIAN I merge.
+
+    clean_list: optional path to a newline-separated file of paths relative to data_dir, as
+    written by clean_duplicates.py. When given, only files on the list are kept -- exact
+    duplicates and cross-label conflicts it found are dropped before label encoding and
+    splitting even start. None (default) keeps every *.jpg the glob finds, so existing callers
+    are unaffected unless they opt in.
 
     Returns (filepaths, all_labs, label_encoder, idx_to_label, num_classes).
     """
     image_dir = Path(data_dir)
     filepaths = sorted(image_dir.glob("*/side_a/*.jpg"))  # same order as embeddings
+    if clean_list is not None:
+        allowed = set(Path(clean_list).read_text().splitlines())
+        filepaths = [p for p in filepaths if str(p.relative_to(image_dir)) in allowed]
     unique_labels = sorted({folder_label(p.parent.parent.name) for p in filepaths})
     label_encoder = {name: i for i, name in enumerate(unique_labels)}
     raw_labels = [folder_label(p.parent.parent.name) for p in filepaths]
@@ -96,12 +105,34 @@ class CoinEvalDataset(Dataset):
         return self.transform(img), self.all_labs[idx]
 
 
-def build_test_dataset(data_dir: Path, test_size: float = 0.2, random_state: int = 42) -> Dataset:
+def build_test_dataset(
+    data_dir: Path, test_size: float = 0.2, random_state: int = 42, clean_list: Path | str | None = None
+) -> Dataset:
     """The frozen test split, transformed the way serving transforms images. The one seam
     evaluate.py needs to score any registered version without reproducing the split logic.
+
+    clean_list here FILTERS the already-computed test_idx down to survivors -- it does NOT
+    change what discover_dataset/split_dataset see, unlike splits.carve()'s use of clean_list.
+    That distinction matters: filtering the universe BEFORE splitting (carve()'s approach) shrinks
+    what train_test_split sees, and since its stratified split consumes one shared RNG stream
+    class by class, dropping even one image from an early class reshuffles every class split
+    after it -- the whole train/test boundary moves. Fine for splits.carve(), which is carving a
+    brand-new partition nothing has trained on yet. NOT fine here: an already-registered model
+    was trained under the ORIGINAL (raw-tree) boundary, so recomputing the split would risk
+    scoring it on images it actually trained on under that original boundary. Splitting first and
+    filtering test_idx after can only shrink the holdout, never pull an image across the line.
     """
     filepaths, all_labs, *_ = discover_dataset(data_dir)
     _, _, test_idx = split_dataset(all_labs, test_size=test_size, random_state=random_state)
+
+    if clean_list is not None:
+        image_dir = Path(data_dir)
+        allowed = set(Path(clean_list).read_text().splitlines())
+        test_idx = np.array(
+            [i for i in test_idx if str(filepaths[i].relative_to(image_dir)) in allowed],
+            dtype=test_idx.dtype,
+        )
+
     return CoinEvalDataset(filepaths, all_labs, test_idx, val_transform)
 
 

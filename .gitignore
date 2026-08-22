@@ -1,6 +1,7 @@
 # Raw dataset (images, embeddings cache, source archives) + root compat symlink
 FOR_TRAINNING
-data/
+/data/FOR_TRAINNING/
+/data/archives/
 
 # Model checkpoints / exported weights
 weights/

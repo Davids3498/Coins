@@ -13,6 +13,7 @@ re-scores live), but it makes the registry honest for humans reading the runs.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Callable
 
 import mlflow
@@ -34,10 +35,17 @@ EVAL_METRIC = "test_acc"
 # exactly ONE definition of the holdout — reproducing the split here would reintroduce the
 # train/serve skew the refactor just killed. Must return a Dataset yielding
 # (image_tensor, label_idx) built with coin_clf.transforms.val_transform (serving's transform).
-def load_holdout(data_dir: str) -> Dataset:
+#
+# clean_list: optional path to clean_duplicates.py's survivor list. build_test_dataset applies
+# it AFTER splitting -- it filters the original raw-tree test_idx down to survivors rather than
+# recomputing the split on a smaller universe, so this never scores a model on an image that
+# landed on the train side of the ORIGINAL boundary it was actually trained under. (That's
+# deliberately different from splits.carve(), which filters before splitting because it's
+# carving a brand-new partition nothing has trained on yet.)
+def load_holdout(data_dir: str, clean_list: str | None = None) -> Dataset:
     from coin_clf.data import build_test_dataset
 
-    return build_test_dataset(data_dir)
+    return build_test_dataset(data_dir, clean_list=clean_list)
 # ---------------------------------------------------------------------------
 
 
@@ -73,12 +81,18 @@ def evaluate_version(
     batch_size: int = 64,
     num_workers: int = 4,
     device: torch.device | None = None,
-    holdout_loader: Callable[[str], Dataset] = load_holdout,
+    clean_list: str | None = None,
+    holdout_loader: Callable[[str, str | None], Dataset] = load_holdout,
 ) -> tuple[str, float]:
     """Load a version from the registry, score it on the frozen holdout, return (version, acc).
 
     Pure scoring — logs NOTHING, so the gate can call it on both models without writing to
     runs. The CLI wrapper below handles logging.
+
+    clean_list defaults to None here (unfiltered, raw tree) same as build_test_dataset/
+    discover_dataset — nothing changes for existing callers (promote.py's internal score()
+    closure doesn't pass it) unless they opt in. The CLI below defaults it to
+    data/clean_files.txt when that file exists.
     """
     mlflow.set_tracking_uri(TRACKING_URI)
     client = MlflowClient()
@@ -86,7 +100,7 @@ def evaluate_version(
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = mlflow.pytorch.load_model(f"models:/{MODEL_NAME}/{resolved}")
-    dataset = holdout_loader(data_dir)
+    dataset = holdout_loader(data_dir, clean_list)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     acc = score(model, loader, device)
     return resolved, acc
@@ -111,7 +125,26 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--no-log", action="store_true", help="score only; do not log to the run")
+    p.add_argument(
+        "--clean-list", default=None,
+        help="clean_duplicates.py survivor list (default: data/clean_files.txt if it exists, "
+             "else no filtering; pass \"\" to explicitly disable)",
+    )
     args = p.parse_args()
+
+    clean_list = args.clean_list
+    if clean_list is None:
+        default_clean_list = Path("data/clean_files.txt")
+        if default_clean_list.exists():
+            clean_list = str(default_clean_list)
+            print(f"using clean list -> {clean_list}")
+        else:
+            print("no clean list found at data/clean_files.txt -- scoring against the raw, uncleaned tree")
+    elif clean_list == "":
+        clean_list = None
+        print("clean list explicitly disabled -- scoring against the raw, uncleaned tree")
+    elif not Path(clean_list).exists():
+        p.error(f"--clean-list {clean_list} not found")
 
     version, acc = evaluate_version(
         version=args.version,
@@ -119,6 +152,7 @@ def main() -> None:
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        clean_list=clean_list,
     )
     print(f"coin-classifier v{version}  {EVAL_METRIC}={acc:.4f}")
     if not args.no_log:
