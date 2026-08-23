@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 MODEL_NAME = "coin-classifier"
@@ -122,7 +123,26 @@ def main() -> None:
     p.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--dry-run", action="store_true", help="decide and print, but do not move the alias")
+    p.add_argument(
+        "--clean-list", default=None,
+        help="clean_duplicates.py survivor list (default: data/clean_files.txt if it exists, "
+             "else no filtering; pass \"\" to explicitly disable)",
+    )
     args = p.parse_args()
+
+    clean_list = args.clean_list
+    if clean_list is None:
+        default_clean_list = Path("data/clean_files.txt")
+        if default_clean_list.exists():
+            clean_list = str(default_clean_list)
+            print(f"using clean list -> {clean_list}")
+        else:
+            print("no clean list found at data/clean_files.txt -- scoring against the raw, uncleaned tree")
+    elif clean_list == "":
+        clean_list = None
+        print("clean list explicitly disabled -- scoring against the raw, uncleaned tree")
+    elif not Path(clean_list).exists():
+        p.error(f"--clean-list {clean_list} not found")
 
     mlflow.set_tracking_uri(TRACKING_URI)
     client = MlflowClient()
@@ -134,7 +154,9 @@ def main() -> None:
             return None
 
     def score(version):
-        _, acc = evaluate_version(version=version, data_dir=args.data_dir, batch_size=args.batch_size)
+        _, acc = evaluate_version(
+            version=version, data_dir=args.data_dir, batch_size=args.batch_size, clean_list=clean_list
+        )
         return acc
 
     def set_champion(version):

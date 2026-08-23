@@ -27,8 +27,7 @@ from torch.utils.data import DataLoader
 from coin_clf.data import (
     CoinDistilDataset,
     class_balanced_weights,
-    discover_dataset,
-    split_dataset,
+    frozen_split,
     weighted_sampler,
 )
 from coin_clf.labels import save_labels
@@ -65,9 +64,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher-test-acc", type=float, default=0.9271,
                     help="v6 full-pipeline test accuracy, used for the compression-gap metric")
     p.add_argument("--tracking-uri", default="http://127.0.0.1:5000")
+    p.add_argument(
+        "--clean-list", default=None,
+        help="clean_duplicates.py survivor list (default: data/clean_files.txt if it exists, "
+             "else no filtering; pass \"\" to explicitly disable)",
+    )
     args = p.parse_args()
     if args.labels_out is None:
         args.labels_out = str(Path(args.weights_dir) / "coin_labels.json")
+
+    if args.clean_list is None:
+        default_clean_list = Path("data/clean_files.txt")
+        if default_clean_list.exists():
+            args.clean_list = str(default_clean_list)
+            print(f"using clean list -> {args.clean_list}")
+        else:
+            print("no clean list found at data/clean_files.txt -- training on the raw, uncleaned tree")
+    elif args.clean_list == "":
+        args.clean_list = None
+        print("clean list explicitly disabled -- training on the raw, uncleaned tree")
+    elif not Path(args.clean_list).exists():
+        p.error(f"--clean-list {args.clean_list} not found")
+
     return args
 
 
@@ -212,19 +230,20 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    filepaths, all_labs, label_encoder, idx_to_label, num_classes = discover_dataset(args.data_dir)
+    filepaths, all_labs, label_encoder, idx_to_label, num_classes, train_idx, val_idx, test_idx = frozen_split(
+        args.data_dir, test_size=0.2, random_state=args.split_seed, clean_list=args.clean_list
+    )
     assert num_classes == args.num_classes, (
         f"Discovered {num_classes} classes in {args.data_dir}, expected {args.num_classes} — "
         "this changes the frozen split/label space, investigate before continuing."
     )
     print(f"{len(filepaths)} images | {num_classes} classes (after GORDIAN merge)")
+    print(f"Train: {len(train_idx)}  Val: {len(val_idx)}  Test: {len(test_idx)}"
+          + (f"  (clean_list={args.clean_list})" if args.clean_list else ""))
 
     soft_labels_path = precompute_teacher_soft_labels(args.data_dir, args.weights_dir, num_classes, device)
     teacher_soft = torch.load(soft_labels_path)
     print(f"Teacher soft labels: {teacher_soft.shape}")
-
-    train_idx, val_idx, test_idx = split_dataset(all_labs, test_size=0.2, random_state=args.split_seed)
-    print(f"Train: {len(train_idx)}  Val: {len(val_idx)}  Test: {len(test_idx)}")
 
     train_ds = CoinDistilDataset(filepaths, all_labs, teacher_soft, train_idx, train_transform)
     val_ds = CoinDistilDataset(filepaths, all_labs, teacher_soft, val_idx, val_transform)
@@ -275,6 +294,7 @@ def main() -> None:
             "sampler": "class_balanced_weighted_random",
             "teacher": "v6_ensemble+subheads",
             "split_seed": args.split_seed,
+            "clean_list": args.clean_list or "none",
         })
 
         best_val_acc, best_state = 0.0, None

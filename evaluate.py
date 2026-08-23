@@ -90,9 +90,9 @@ def evaluate_version(
     runs. The CLI wrapper below handles logging.
 
     clean_list defaults to None here (unfiltered, raw tree) same as build_test_dataset/
-    discover_dataset — nothing changes for existing callers (promote.py's internal score()
-    closure doesn't pass it) unless they opt in. The CLI below defaults it to
-    data/clean_files.txt when that file exists.
+    discover_dataset — a bare `evaluate_version(...)` call is still unfiltered unless a caller
+    opts in. Both this CLI and promote.py's CLI default THEIR clean_list argument to
+    data/clean_files.txt when that file exists, then pass it through explicitly.
     """
     mlflow.set_tracking_uri(TRACKING_URI)
     client = MlflowClient()
