@@ -17,21 +17,25 @@ whatever idx_to_label mapping it already has) before calling validate_batch().
 Duplicate-hash detection reuses coin_clf.hashing.file_hash -- the same SHA-256-over-bytes logic
 clean_duplicates.py uses to hash the raw tree -- so a batch image and a reference image collide
 under validate_batch() if and only if clean_duplicates.py would also call them duplicates.
+Width/height/mode come from coin_clf.image_meta for the same reason: the serving layer's
+prediction log reads image metadata too, and the gate's notion of an image's mode and the
+monitoring layer's must be one notion, not two that happen to agree today.
 """
 from __future__ import annotations
 
+import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
-from PIL import Image, UnidentifiedImageError
 
 from coin_clf.hashing import file_hash
+from coin_clf.image_meta import metadata_from_path
 
 DEFAULT_MIN_DIM = 32
 DEFAULT_MAX_CLASS_SHARE = 0.5  # one class filling more than half a batch is "wildly over-represented"
-_UNREADABLE_EXCEPTIONS = (OSError, SyntaxError, UnidentifiedImageError)
 
 
 @dataclass(frozen=True)
@@ -77,24 +81,15 @@ def _build_frame(batch: Iterable[tuple[str | Path, str]]) -> pd.DataFrame:
     rows = []
     for path, label in batch:
         path = Path(path)
-        width = height = mode = None
-        readable = True
-        try:
-            with Image.open(path) as img:
-                img.verify()  # cheap corruption check; invalidates `img` for further reads
-            with Image.open(path) as img:  # re-open: verify() leaves the handle unusable
-                width, height = img.size
-                mode = img.mode
-        except _UNREADABLE_EXCEPTIONS:
-            readable = False
+        meta = metadata_from_path(path)  # None == unreadable/corrupt
         rows.append({
             "path": path,
             "label": label,
-            "width": width,
-            "height": height,
-            "mode": mode,
+            "width": meta.width if meta else None,
+            "height": meta.height if meta else None,
+            "mode": meta.mode if meta else None,
             "hash": file_hash(path),
-            "readable": readable,
+            "readable": meta is not None,
         })
     return pd.DataFrame(rows, columns=["path", "label", "width", "height", "mode", "hash", "readable"])
 
@@ -190,3 +185,90 @@ def validate_batch(
         checks=tuple(checks),
         frame=frame,
     )
+
+
+def _read_batch_file(path: Path) -> list[tuple[str, str]]:
+    """Parse release_batch.py's '<absolute path>,<label>' rows, one image per line."""
+    rows = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        img_path, label = line.rsplit(",", 1)
+        rows.append((img_path, label))
+    return rows
+
+
+def main() -> None:
+    """CLI wrapper for the retraining DAG's validate task: score one released batch and write a
+    JSON report. Always exits 0 -- validate_batch() never raises for a bad batch, only for a
+    malformed call, so a bad batch here is a normal outcome the DAG quarantines (via
+    gate_on_validation reading is_valid out of the report), not a task failure.
+    """
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--batch-file", required=True,
+                    help="'path,label' rows, as written by release_batch.py")
+    p.add_argument("--data-dir", required=True,
+                    help="root the manifest's/active-train-list's relative paths resolve against")
+    p.add_argument("--manifest", required=True,
+                    help="splits.py manifest -- source of known_classes and the holdout half of "
+                         "the leakage reference set")
+    p.add_argument("--active-train-list", required=True,
+                    help="source of the train half of the leakage reference set")
+    p.add_argument("--report-out", required=True)
+    p.add_argument("--min-dim", type=int, default=DEFAULT_MIN_DIM)
+    p.add_argument("--max-class-share", type=float, default=DEFAULT_MAX_CLASS_SHARE)
+    args = p.parse_args()
+
+    batch = _read_batch_file(Path(args.batch_file))
+    manifest = json.loads(Path(args.manifest).read_text())
+    known_classes = list(manifest["label_encoder"].keys())
+
+    data_dir = Path(args.data_dir).resolve()
+    # release_batch.py already appended THIS batch's own files to active_train_list before
+    # validate ever runs (its task order is release -> validate, not the other way round) -- so
+    # the reference set has to exclude this batch's own relpaths, or every batch would trivially
+    # "already be ingested" against itself. Anything else in active_train_list (the clean seed
+    # plus any earlier, already-validated batches) is fair game for the leakage check. A batch
+    # row that isn't under data_dir at all (never true for release_batch.py's own output, but
+    # not a reason to crash the task) just has nothing to exclude -- it's obviously not one of
+    # the pre-existing reference files either way.
+    batch_relpaths = set()
+    for path, _ in batch:
+        try:
+            batch_relpaths.add(str(Path(path).resolve().relative_to(data_dir)))
+        except ValueError:
+            continue
+    reference_relpaths = (
+        set(Path(args.active_train_list).read_text().splitlines()) | set(manifest["splits"]["holdout"])
+    ) - batch_relpaths
+    print(f"hashing {len(reference_relpaths)} reference image(s) (active train + holdout, "
+          "excluding this batch) for the leakage check...")
+    known_hashes = {file_hash(data_dir / rel) for rel in reference_relpaths}
+
+    report = validate_batch(
+        batch, known_classes, min_dim=args.min_dim, known_hashes=known_hashes,
+        max_class_share=args.max_class_share,
+    )
+
+    print(repr(report))
+    for check in report.checks:
+        status = "PASS" if check.passed else "FAIL"
+        print(f"  [{status}] {check.name}: {check.detail}")
+
+    out = {
+        "is_valid": report.is_valid,
+        "n_images": len(report.frame),
+        "checks": [
+            {"name": c.name, "passed": c.passed, "detail": c.detail, "n_offending": len(c.offending_paths)}
+            for c in report.checks
+        ],
+        "offending_rows": report.offending_rows,
+    }
+    out_path = Path(args.report_out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+    print(f"wrote report -> {args.report_out}  is_valid={report.is_valid}")
+
+
+if __name__ == "__main__":
+    main()

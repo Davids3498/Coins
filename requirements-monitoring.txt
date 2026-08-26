@@ -1,0 +1,16 @@
+# Offline drift monitoring (drift_report.py) ONLY.
+#
+# Deliberately separate from requirements-serve.txt: evidently pulls in ~30 packages (litestar,
+# plotly, nltk, statsmodels, cryptography...) and none of them belong in the serving image, which
+# stays slim enough that /predict's dependency surface is fastapi + torch + pillow. The drift
+# check is an offline reader of the prediction log, never part of the API.
+#
+# Verified against this project's stack before pinning: evidently 0.7.21 accepts numpy 1.26.4,
+# pandas 1.5.3, scipy 1.11.4 and scikit-learn 1.4.x, so installing it does NOT move torch's
+# numeric dependencies.
+#
+# fsspec is pinned to the one version that satisfies BOTH evidently (>=2024.9.0) and huggingface
+# datasets (<=2024.9.0), which share this environment. Left unpinned, pip resolves fsspec far
+# forward and breaks datasets.
+evidently==0.7.21
+fsspec==2024.9.0

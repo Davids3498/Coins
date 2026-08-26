@@ -35,4 +35,8 @@ __pycache__/
 *.md
 !README.md
 
-makefile
+# makefile is tracked: it carries the serving container's outputs/monitoring volume mount,
+# without which /predict logs into a --rm container and the drift check has nothing to read.
+
+.venv-airflow/
+.airflow/
