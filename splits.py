@@ -1,15 +1,13 @@
 """splits.py -- the ONE place the full coin dataset gets carved into three disjoint pools.
 
     train           (~60%) -- everything an initial/current model is allowed to train on.
-    frozen-holdout  (~20%) -- the SAME partition evaluate.py / promote.py already score every
-                              model version against, AS LONG AS clean_list is None (the default
-                              for both). Built by calling coin_clf.data.split_dataset directly and
-                              keeping only its test_idx, so this module can't drift into a second
-                              definition of the holdout (see evaluate.py's warning about
-                              reproducing the split introducing train/serve skew). Carving with a
-                              clean_list changes the universe split_dataset ever sees, so that
-                              guarantee only holds if evaluate.py's load_holdout is updated to
-                              filter through the same clean_list -- it currently isn't.
+    frozen-holdout  (~20%) -- THE holdout. The manifest this module writes is the single
+                              definition of it in the codebase: coin_clf.data.build_manifest_holdout
+                              reads it back, and evaluate.py / promote.py / train.py / export.py
+                              all resolve through that one function. The two rival definitions
+                              that used to exist (frozen_split's independent 80/20 draw and
+                              build_test_dataset) are gone -- carving is now the only way a
+                              holdout comes into existence.
     future-pool     (~20%) -- withheld entirely. Never trained on, never evaluated against.
                               Stands in for data that "arrives" after the model is live; the
                               retraining DAG pulls it in fixed-size batches (`FuturePool`, via
@@ -106,7 +104,8 @@ class DatasetSplits:
         return path
 
     @classmethod
-    def load(cls, path: str | Path, data_dir: str | Path) -> "DatasetSplits":
+    def load(cls, path: str | Path, data_dir: str | Path,
+             *, allow_raw_tree: bool = False) -> "DatasetSplits":
         """Re-derive indices for the CURRENT discover_dataset(data_dir) from a saved manifest.
 
         Guards against silent drift: if the label space no longer matches (folder added,
@@ -118,7 +117,9 @@ class DatasetSplits:
         if manifest["version"] != MANIFEST_VERSION:
             raise ValueError(f"manifest version {manifest['version']} != supported {MANIFEST_VERSION}")
 
-        filepaths, all_labs, label_encoder, idx_to_label, _ = discover_dataset(data_dir)
+        filepaths, all_labs, label_encoder, idx_to_label, _ = discover_dataset(
+            data_dir, allow_raw_tree=allow_raw_tree
+        )
         if label_encoder != manifest["label_encoder"]:
             raise ValueError(
                 "label_encoder in the manifest no longer matches discover_dataset(data_dir) -- "
@@ -156,21 +157,20 @@ def carve(
     future_size: float = DEFAULT_FUTURE_SIZE,
     seed: int = DEFAULT_SEED,
     clean_list: str | Path | None = None,
+    allow_raw_tree: bool = False,
 ) -> DatasetSplits:
     """Deterministically carve discover_dataset(data_dir) into train / holdout / future-pool.
 
-    Stage 1 calls coin_clf.data.split_dataset and keeps ONLY its test_idx -- byte-identical to
-    the frozen holdout evaluate.py and promote.py already score every version against, because
-    it IS that function, not a reimplementation of it (see the clean_list caveat above though).
+    Stage 1 calls coin_clf.data.split_dataset and keeps ONLY its test_idx. Stage 2 stratified-
+    splits everything NOT in the holdout again, with future_size treated as a fraction of the
+    FULL dataset (not of the 1-holdout_size remainder) -- e.g. holdout_size=0.2, future_size=0.2
+    leaves train at 60% of the total, not 60% of the leftover 80%.
 
-    Stage 2 stratified-splits everything NOT in the holdout again, with future_size treated as a
-    fraction of the FULL dataset (not of the 1-holdout_size remainder) -- e.g. holdout_size=0.2,
-    future_size=0.2 leaves train at 60% of the total, not 60% of the leftover 80%.
-
-    clean_list: optional path to clean_duplicates.py's survivor list. When given, discover_dataset
-    drops duplicate/conflicted files BEFORE any of the three pools are carved, so bad data can't
-    end up split across train/holdout/future-pool in the first place. None (default) carves the
-    raw, uncleaned tree.
+    CLEAN BY DEFAULT: discover_dataset filters to data/clean_files.txt unless allow_raw_tree=True,
+    dropping duplicates and cross-label conflicts BEFORE any of the three pools are carved, so bad
+    data can't end up split across train/holdout/future-pool in the first place. Carving the raw
+    tree produced a partition with ~6,900 train/holdout byte-collisions; that is why it is no
+    longer reachable by accident.
     """
     if not 0 < holdout_size < 1:
         raise ValueError(f"holdout_size must be in (0, 1), got {holdout_size}")
@@ -182,7 +182,9 @@ def carve(
             f"got {holdout_size} + {future_size} >= 1"
         )
 
-    filepaths, all_labs, label_encoder, idx_to_label, _ = discover_dataset(data_dir, clean_list=clean_list)
+    filepaths, all_labs, label_encoder, idx_to_label, _ = discover_dataset(
+        data_dir, clean_list=clean_list, allow_raw_tree=allow_raw_tree
+    )
     labels_np = all_labs.numpy()
 
     _, _, holdout_idx = split_dataset(all_labs, test_size=holdout_size, random_state=seed)
@@ -280,31 +282,28 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument(
         "--clean-list", default=None,
-        help="clean_duplicates.py survivor list (default: data/clean_files.txt if it exists, "
-             "else no filtering; pass \"\" to explicitly disable)",
+        help="clean_duplicates.py survivor list (default: data/clean_files.txt; missing is a "
+             "hard error, not a fallback to raw data)",
+    )
+    p.add_argument(
+        "--allow-raw-tree", action="store_true",
+        help="carve the RAW, uncleaned tree -- duplicates and cross-label conflicts included. "
+             "This produces a partition with thousands of train/holdout byte-collisions and must "
+             "never be used for a model you intend to score or promote.",
     )
     args = p.parse_args()
 
-    clean_list = args.clean_list
-    if clean_list is None:
-        default_clean_list = Path("data/clean_files.txt")
-        if default_clean_list.exists():
-            clean_list = default_clean_list
-            print(f"using clean list -> {clean_list}")
-        else:
-            print("no clean list found at data/clean_files.txt -- carving the raw, uncleaned tree")
-    elif clean_list == "":
-        clean_list = None
-        print("clean list explicitly disabled -- carving the raw, uncleaned tree")
-    elif not Path(clean_list).exists():
-        p.error(f"--clean-list {clean_list} not found")
+    if args.allow_raw_tree:
+        print("WARNING: --allow-raw-tree -- carving the raw, uncleaned tree. The resulting "
+              "partition is NOT leakage-free.")
 
     splits = carve(
         args.data_dir,
         holdout_size=args.holdout_size,
         future_size=args.future_size,
         seed=args.seed,
-        clean_list=clean_list,
+        clean_list=args.clean_list,
+        allow_raw_tree=args.allow_raw_tree,
     )
     out = splits.save(args.out, data_dir=args.data_dir)
 

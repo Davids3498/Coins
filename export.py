@@ -1,10 +1,11 @@
 """ONNX export + int8 quantization for a trained coin_clf student checkpoint.
 
-Converted from Section F of notebooks/emp_model_knowledge_distilation.ipynb.
 Standalone: only needs a trained state_dict, not the full dataset. Pass
---data-dir to also verify int8 accuracy on the frozen held-out test set (this
-reconstructs the split via coin_clf.data; it does not need the teacher soft
-labels file, since only the hard-label element of each sample is used here).
+--data-dir to also verify int8 accuracy on the frozen holdout -- the SAME
+11,559-image set evaluate.py and promote.py score against, via
+coin_clf.data.build_manifest_holdout. It used to reconstruct a raw-tree 80/20
+split of its own, which overlapped the training set by 5,689 images and so
+reported an int8 accuracy that was not comparable to any other number here.
 """
 from __future__ import annotations
 
@@ -28,8 +29,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default=".")
     p.add_argument("--opset", type=int, default=17)
     p.add_argument("--data-dir", default=None,
-                    help="if set, also evaluates int8 accuracy on the held-out test set")
-    p.add_argument("--split-seed", type=int, default=42)
+                    help="if set, also evaluates int8 accuracy on the frozen manifest holdout")
+    p.add_argument("--manifest", default=None,
+                    help="splits.py manifest pinning the frozen holdout "
+                         "(default: data/splits_manifest.json)")
     p.add_argument("--batch-size", type=int, default=128)
     return p.parse_args()
 
@@ -82,23 +85,19 @@ def check_parity(model, onnx_path: Path, int8_path: Path, input_size: int) -> No
 def evaluate_int8_on_test_set(int8_path: Path, args: argparse.Namespace) -> float:
     from torch.utils.data import DataLoader
 
-    from coin_clf.data import CoinDistilDataset, discover_dataset, split_dataset
-    from coin_clf.transforms import val_transform
+    from coin_clf.data import build_manifest_holdout
 
-    filepaths, all_labs, _, _, num_classes = discover_dataset(args.data_dir)
-    _, _, test_idx = split_dataset(all_labs, test_size=0.2, random_state=args.split_seed)
-    dummy_soft = torch.zeros(len(filepaths), num_classes)  # unused: only hard labels are checked here
-    test_ds = CoinDistilDataset(filepaths, all_labs, dummy_soft, test_idx, val_transform)
+    test_ds = build_manifest_holdout(args.data_dir, args.manifest)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     sess_int8 = ort.InferenceSession(str(int8_path))
     correct, total = 0, 0
-    for imgs, _, hard_labels in test_loader:
+    for imgs, labels in test_loader:
         logits = sess_int8.run(None, {"image": imgs.numpy()})[0]
-        correct += (logits.argmax(-1) == hard_labels.numpy()).sum()
-        total += len(hard_labels)
+        correct += (logits.argmax(-1) == labels.numpy()).sum()
+        total += len(labels)
     acc = correct / total
-    print(f"ONNX int8 test accuracy: {acc:.4f}  ({correct}/{total})")
+    print(f"ONNX int8 holdout accuracy: {acc:.4f}  ({correct}/{total})")
     return acc
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import shutil
 import sys
 from collections import defaultdict
@@ -89,10 +90,41 @@ def write_outputs(
         writer.writerows(drops)
 
 
-def quarantine(data_dir: Path, drops: list[dict], quarantine_dir: Path) -> None:
+def protected_relpaths(manifest_path: Path, active_train_list: Path) -> set[str]:
+    """Every relpath a live partition depends on: the manifest's three pools plus the active
+    training list. Quarantining any of these would silently shrink a split that other code
+    believes is fixed -- which is exactly the class of bug this whole cleanup exists to end.
+    """
+    protected: set[str] = set()
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        for pool in manifest.get("splits", {}).values():
+            protected.update(pool)
+    if active_train_list.exists():
+        protected.update(l for l in active_train_list.read_text().splitlines() if l.strip())
+    return protected
+
+
+def quarantine(data_dir: Path, drops: list[dict], quarantine_dir: Path,
+               protected: set[str] | None = None) -> None:
+    """MOVE dropped files out of the training tree. Reversible: the relative layout is preserved
+    under quarantine_dir, so `mv` back restores the tree exactly.
+
+    Refuses to move anything a live partition references (see protected_relpaths).
+    """
+    if protected:
+        collisions = [row["path"] for row in drops if row["path"] in protected]
+        if collisions:
+            raise RuntimeError(
+                f"refusing to quarantine {len(collisions)} file(s) that a live split still "
+                f"references (e.g. {collisions[0]}). The clean list and the manifest disagree -- "
+                f"re-carve before quarantining."
+            )
     for row in drops:
         src = data_dir / row["path"]
         dst = quarantine_dir / row["path"]
+        if not src.exists():
+            continue  # already quarantined by an earlier run; move is idempotent
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
 
@@ -104,6 +136,10 @@ def main() -> None:
     p.add_argument("--drop-log", default="data/drop_log.csv")
     p.add_argument("--quarantine-dir", default=None,
                     help="if set, MOVE dropped files here instead of leaving them in place")
+    p.add_argument("--manifest", default="data/splits_manifest.json",
+                    help="live splits manifest whose files must never be quarantined")
+    p.add_argument("--active-train-list", default="data/active_train.txt",
+                    help="live active training list whose files must never be quarantined")
     args = p.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -123,8 +159,13 @@ def main() -> None:
     print(f"drop log   -> {args.drop_log}")
 
     if args.quarantine_dir:
-        quarantine(data_dir, drops, Path(args.quarantine_dir))
+        protected = protected_relpaths(Path(args.manifest), Path(args.active_train_list))
+        print(f"{len(protected)} relpath(s) protected by live splits -- verifying no overlap "
+              f"with the {len(drops)} drops...")
+        quarantine(data_dir, drops, Path(args.quarantine_dir), protected=protected)
         print(f"moved {len(drops)} dropped files -> {args.quarantine_dir}")
+        remaining = len(sorted(data_dir.glob("*/side_a/*.jpg")))
+        print(f"training tree now holds {remaining} image(s) (expected {len(keep)})")
     else:
         print("dry-run: nothing moved. Pass --quarantine-dir to actually pull dropped files "
               "out of the training tree.")

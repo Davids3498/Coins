@@ -1,8 +1,16 @@
-"""Knowledge-distillation training: v6 teacher -> MobileNetV3-Large student.
+"""Supervised training: MobileNetV3-Large on the verified-clean coin corpus.
 
-Converted from notebooks/emp_model_knowledge_distilation.ipynb. Registers a new
-model version in the MLflow registry as a challenger — it does NOT set or move
-the @champion alias. Promotion is a separate, deliberate step.
+Trains on ONE boundary -- coin_clf.data.active_split -- and scores on ONE holdout, the
+splits.py manifest's. There is no raw-tree path, no second split definition, and no way to
+reach either by omitting a flag.
+
+Registers a new model version in the MLflow registry as a challenger; it does NOT set or move
+the @champion alias. Promotion is a separate, deliberate step (promote.py).
+
+NO DISTILLATION. This used to distill from the v6 teacher ensemble via cached soft labels. The
+teacher was trained on contaminated data, so everything distilled from it inherited the
+contamination -- teacher, soft labels and the compression-gap metric are all gone, and the
+student now learns from hard labels alone.
 """
 from __future__ import annotations
 
@@ -10,6 +18,7 @@ import argparse
 import copy
 import math
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -25,27 +34,24 @@ from mlflow.models import infer_signature
 from torch.utils.data import DataLoader
 
 from coin_clf.data import (
-    CoinDistilDataset,
+    CoinImageDataset,
+    active_split,
     class_balanced_weights,
-    frozen_split,
     weighted_sampler,
 )
+from coin_clf.hashing import fingerprint, hash_many
 from coin_clf.labels import save_labels
 from coin_clf.model import build_model
-from coin_clf.teacher import CoinHeadV6, SubHead
 from coin_clf.transforms import train_transform, val_transform
 from checkpoint import save_checkpoint
 
 EXPERIMENT_NAME = "coin-classifier"
 MODEL_NAME = "coin-classifier"
 
-# Per-cluster sub-classifier redistribution weights, tuned in v6.
-SUB_WEIGHTS = {"QAC": 0.7, "VAG": 0.9, "SDP": 0.8, "TETRARCHY": 0.2, "SEVERAN_HARD": 1.0}
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data-dir", default="/home/david/coin/FOR_TRAINNING")
+    p.add_argument("--data-dir", default="/home/david/coin/data/FOR_TRAINNING")
     p.add_argument("--weights-dir", default="/home/david/coin/weights")
     p.add_argument("--labels-out", default=None,
                     help="default: <weights-dir>/coin_labels.json")
@@ -57,122 +63,127 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--warmup-epochs", type=int, default=2)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--distill-temp", type=float, default=4.0)
-    p.add_argument("--distill-alpha", type=float, default=0.7)
+    p.add_argument("--label-smoothing", type=float, default=0.1)
     p.add_argument("--class-balance-beta", type=float, default=0.9999)
     p.add_argument("--split-seed", type=int, default=42)
-    p.add_argument("--teacher-test-acc", type=float, default=0.9271,
-                    help="v6 full-pipeline test accuracy, used for the compression-gap metric")
     p.add_argument("--tracking-uri", default="http://127.0.0.1:5000")
     p.add_argument(
-        "--clean-list", default=None,
-        help="clean_duplicates.py survivor list (default: data/clean_files.txt if it exists, "
-             "else no filtering; pass \"\" to explicitly disable)",
+        "--active-train-list", default=None,
+        help="the retraining loop's growing training universe (default: data/active_train.txt). "
+             "Missing is a hard error -- release_batch.py bootstraps it, or pass "
+             "--train-from-manifest to train on the manifest's own train split.",
+    )
+    p.add_argument(
+        "--train-from-manifest", action="store_true",
+        help="train on the manifest's train split instead of the active training list -- the "
+             "clean starting state, before any future-pool batch has been released",
+    )
+    p.add_argument(
+        "--manifest", default=None,
+        help="splits.py manifest pinning the frozen holdout (default: data/splits_manifest.json). "
+             "The only holdout definition; a missing manifest is a hard error.",
+    )
+    p.add_argument(
+        "--version-out", default=None,
+        help="if given, write the newly registered challenger's version string to this path",
     )
     args = p.parse_args()
     if args.labels_out is None:
         args.labels_out = str(Path(args.weights_dir) / "coin_labels.json")
-
-    if args.clean_list is None:
-        default_clean_list = Path("data/clean_files.txt")
-        if default_clean_list.exists():
-            args.clean_list = str(default_clean_list)
-            print(f"using clean list -> {args.clean_list}")
-        else:
-            print("no clean list found at data/clean_files.txt -- training on the raw, uncleaned tree")
-    elif args.clean_list == "":
-        args.clean_list = None
-        print("clean list explicitly disabled -- training on the raw, uncleaned tree")
-    elif not Path(args.clean_list).exists():
-        p.error(f"--clean-list {args.clean_list} not found")
-
+    if args.train_from_manifest and args.active_train_list is not None:
+        p.error("pass either --active-train-list or --train-from-manifest, not both")
     return args
 
 
-def precompute_teacher_soft_labels(data_dir: Path, weights_dir: Path, num_classes: int, device) -> Path:
-    """Runs the full v6 pipeline (ensemble + sub-classifiers) once and caches soft labels to disk."""
-    soft_labels_path = Path(data_dir) / "teacher_soft_labels.pt"
-    if soft_labels_path.exists():
-        print("Teacher soft labels already on disk — skipping generation.")
-        return soft_labels_path
+@dataclass
+class TrainingData:
+    """Everything the training loop needs, built from the ONE canonical data path.
 
-    v41_data = torch.load(Path(data_dir) / "cradio_v41_embeddings.pt")
-    crops_data = torch.load(Path(data_dir) / "cradio_v5_crops.pt")
+    Exists so the training notebook imports this instead of rebuilding its own datasets,
+    sampler and loaders. The notebook and the pipeline drifting apart is what produced two
+    different ideas of the holdout last time; there is now nothing left for them to disagree
+    about, because they call the same function.
+    """
 
-    feats_full = v41_data["features"].to(device)
-    feats_portrait = crops_data["features_portrait"].to(device)
-    feats_legend = crops_data["features_legend"].to(device)
-    print(f"Embeddings loaded: {feats_full.shape[0]} images")
+    filepaths: list
+    all_labs: torch.Tensor
+    label_encoder: dict
+    idx_to_label: dict
+    num_classes: int
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+    test_idx: np.ndarray
+    train_loader: DataLoader
+    val_loader: DataLoader
+    test_loader: DataLoader
+    cb_weights: torch.Tensor
+    train_source: str
+    holdout_fingerprint: str
 
-    ensemble_states = torch.load(Path(weights_dir) / "emp_model_v6_ensemble.pth", map_location=device)
-    teacher_ensemble = []
-    for state in ensemble_states:
-        m = CoinHeadV6(num_classes).to(device)
-        m.load_state_dict(state)
-        m.eval()
-        teacher_ensemble.append(m)
-    print(f"Loaded {len(teacher_ensemble)}-head main ensemble.")
+    @property
+    def sizes(self) -> dict[str, int]:
+        return {"train": len(self.train_idx), "val": len(self.val_idx),
+                "holdout": len(self.test_idx)}
 
-    sub_save = torch.load(Path(weights_dir) / "emp_model_v6_sub.pth", map_location=device)
-    sub_classifiers = {}
-    for name, info in sub_save.items():
-        cluster_idxs = info["idxs"]
-        sub_ens = []
-        for state in info["states"]:
-            m = SubHead(3840, len(cluster_idxs)).to(device)
-            m.load_state_dict(state)
-            m.eval()
-            sub_ens.append(m)
-        sub_classifiers[name] = {"ensemble": sub_ens, "idxs": cluster_idxs}
-    print(f"Loaded sub-classifiers: {list(sub_classifiers.keys())}")
+    def summary(self) -> str:
+        s = self.sizes
+        return (f"train={s['train']}  val={s['val']}  holdout={s['holdout']}  "
+                f"holdout_fingerprint={self.holdout_fingerprint}")
 
-    BATCH = 512
-    N = feats_full.shape[0]
-    all_soft = torch.zeros(N, num_classes)
 
-    with torch.no_grad():
-        for start in range(0, N, BATCH):
-            end = min(start + BATCH, N)
-            xf = feats_full[start:end]
-            xp = feats_portrait[start:end]
-            xl = feats_legend[start:end]
+def prepare_data(
+    data_dir,
+    *,
+    active_train_list=None,
+    manifest=None,
+    from_manifest_train: bool = False,
+    split_seed: int = 42,
+    batch_size: int = 128,
+    class_balance_beta: float = 0.9999,
+    num_workers: int = 4,
+) -> TrainingData:
+    """Resolve the canonical split and build the loaders. The single seam both train.py's CLI
+    and notebooks/coin_mobilenet_hard_labels.ipynb go through.
 
-            probs = None
-            for m in teacher_ensemble:
-                p = F.softmax(m(xf, xp, xl), dim=-1)
-                probs = p if probs is None else probs + p
-            probs /= len(teacher_ensemble)
+    The holdout fingerprint it returns is the content-hash fingerprint of the holdout images --
+    print it at the top of any run to make it visible, on the face of the run, which holdout was
+    actually scored.
+    """
+    filepaths, all_labs, label_encoder, idx_to_label, num_classes, train_idx, val_idx, test_idx = active_split(
+        data_dir,
+        active_train_list=active_train_list,
+        manifest_path=manifest,
+        random_state=split_seed,
+        from_manifest_train=from_manifest_train,
+    )
 
-            for cluster_name, info in sub_classifiers.items():
-                sw = SUB_WEIGHTS.get(cluster_name, 0.0)
-                if sw == 0.0:
-                    continue
-                cluster_idxs = info["idxs"]
-                sub_p = None
-                for m in info["ensemble"]:
-                    p = F.softmax(m(xf), dim=-1)
-                    sub_p = p if sub_p is None else sub_p + p
-                sub_p /= len(info["ensemble"])
+    train_ds = CoinImageDataset(filepaths, all_labs, train_idx, train_transform)
+    val_ds = CoinImageDataset(filepaths, all_labs, val_idx, val_transform)
+    test_ds = CoinImageDataset(filepaths, all_labs, test_idx, val_transform)
 
-                mass = probs[:, cluster_idxs].sum(dim=-1, keepdim=True)
-                redistributed = mass * sub_p
-                blended = (1 - sw) * probs[:, cluster_idxs] + sw * redistributed
-                for local_i, global_i in enumerate(cluster_idxs):
-                    probs[:, global_i] = blended[:, local_i]
-                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+    train_labs_idx = all_labs[train_idx]
+    cb_weights = class_balanced_weights(train_labs_idx, num_classes, beta=class_balance_beta)
+    train_sampler = weighted_sampler(train_labs_idx, cb_weights, num_samples=len(train_ds))
 
-            all_soft[start:end] = probs.cpu()
-            if (start // BATCH) % 10 == 0:
-                print(f"  {end}/{N}")
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=True)
 
-    torch.save(all_soft, soft_labels_path)
-    print(f"Saved teacher soft labels -> {soft_labels_path}  shape={all_soft.shape}")
+    holdout_fp = fingerprint(hash_many([filepaths[i] for i in test_idx]).values())
+    train_source = "manifest train split" if from_manifest_train else str(
+        active_train_list or "data/active_train.txt"
+    )
 
-    del teacher_ensemble, sub_classifiers, feats_full, feats_portrait, feats_legend
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return soft_labels_path
+    return TrainingData(
+        filepaths=filepaths, all_labs=all_labs, label_encoder=label_encoder,
+        idx_to_label=idx_to_label, num_classes=num_classes,
+        train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+        train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
+        cb_weights=cb_weights, train_source=train_source, holdout_fingerprint=holdout_fp,
+    )
 
 
 def make_scheduler(optimizer, total_steps, warmup_steps):
@@ -184,21 +195,14 @@ def make_scheduler(optimizer, total_steps, warmup_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def distillation_loss(student_logits, teacher_probs, hard_labels, temp, alpha, cb_weights):
-    student_log_soft = F.log_softmax(student_logits / temp, dim=-1)
-    soft_loss = F.kl_div(student_log_soft, teacher_probs, reduction="batchmean") * (temp ** 2)
-    hard_loss = F.cross_entropy(student_logits, hard_labels, weight=cb_weights)
-    return alpha * soft_loss + (1 - alpha) * hard_loss
-
-
 @torch.no_grad()
 def evaluate_hard(model, loader, device) -> float:
     model.eval()
     correct, total = 0, 0
-    for imgs, _, hard_labels in loader:
-        imgs, hard_labels = imgs.to(device), hard_labels.to(device)
-        correct += (model(imgs).argmax(-1) == hard_labels).sum().item()
-        total += hard_labels.size(0)
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        correct += (model(imgs).argmax(-1) == labels).sum().item()
+        total += labels.size(0)
     return correct / total
 
 
@@ -206,10 +210,10 @@ def evaluate_hard(model, loader, device) -> float:
 def confusion_matrix(model, loader, device, num_classes: int) -> np.ndarray:
     model.eval()
     cm = np.zeros((num_classes, num_classes), dtype=int)
-    for imgs, _, hard_labels in loader:
-        imgs, hard_labels = imgs.to(device), hard_labels.to(device)
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
         preds = model(imgs).argmax(-1)
-        for t, p in zip(hard_labels.cpu(), preds.cpu()):
+        for t, p in zip(labels.cpu(), preds.cpu()):
             cm[t.item(), p.item()] += 1
     return cm
 
@@ -230,35 +234,28 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    filepaths, all_labs, label_encoder, idx_to_label, num_classes, train_idx, val_idx, test_idx = frozen_split(
-        args.data_dir, test_size=0.2, random_state=args.split_seed, clean_list=args.clean_list
+    data = prepare_data(
+        args.data_dir,
+        active_train_list=args.active_train_list,
+        manifest=args.manifest,
+        from_manifest_train=args.train_from_manifest,
+        split_seed=args.split_seed,
+        batch_size=args.batch_size,
+        class_balance_beta=args.class_balance_beta,
     )
+    num_classes, idx_to_label = data.num_classes, data.idx_to_label
+    train_idx, val_idx, test_idx = data.train_idx, data.val_idx, data.test_idx
+    train_loader, val_loader, test_loader = data.train_loader, data.val_loader, data.test_loader
+    cb_weights = data.cb_weights
+
+    print(f"training on {data.train_source}  "
+          f"holdout={args.manifest or 'data/splits_manifest.json'}")
     assert num_classes == args.num_classes, (
         f"Discovered {num_classes} classes in {args.data_dir}, expected {args.num_classes} — "
-        "this changes the frozen split/label space, investigate before continuing."
+        "this changes the split/label space, investigate before continuing."
     )
-    print(f"{len(filepaths)} images | {num_classes} classes (after GORDIAN merge)")
-    print(f"Train: {len(train_idx)}  Val: {len(val_idx)}  Test: {len(test_idx)}"
-          + (f"  (clean_list={args.clean_list})" if args.clean_list else ""))
-
-    soft_labels_path = precompute_teacher_soft_labels(args.data_dir, args.weights_dir, num_classes, device)
-    teacher_soft = torch.load(soft_labels_path)
-    print(f"Teacher soft labels: {teacher_soft.shape}")
-
-    train_ds = CoinDistilDataset(filepaths, all_labs, teacher_soft, train_idx, train_transform)
-    val_ds = CoinDistilDataset(filepaths, all_labs, teacher_soft, val_idx, val_transform)
-    test_ds = CoinDistilDataset(filepaths, all_labs, teacher_soft, test_idx, val_transform)
-
-    train_labs_idx = all_labs[train_idx]
-    cb_weights = class_balanced_weights(train_labs_idx, num_classes, beta=args.class_balance_beta)
-    train_sampler = weighted_sampler(train_labs_idx, cb_weights, num_samples=len(train_ds))
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler,
-                               num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                              num_workers=4, pin_memory=True)
+    print(f"{len(data.filepaths)} images | {num_classes} classes (after GORDIAN merge)")
+    print(data.summary())
     print(f"Loaders ready. Batches per epoch: {len(train_loader)}")
 
     model = build_model(num_classes, pretrained=True).to(device)
@@ -274,7 +271,7 @@ def main() -> None:
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    with mlflow.start_run(run_name="distill-mobilenetv3") as run:
+    with mlflow.start_run(run_name="mobilenetv3-supervised") as run:
         mlflow.log_params({
             "arch": "mobilenet_v3_large",
             "pretrained": True,
@@ -288,13 +285,17 @@ def main() -> None:
             "scheduler": "linear_warmup_cosine_decay",
             "warmup_epochs": args.warmup_epochs,
             "grad_clip": args.grad_clip,
-            "distill_temp": args.distill_temp,
-            "distill_alpha": args.distill_alpha,
+            "label_smoothing": args.label_smoothing,
             "class_balance_beta": args.class_balance_beta,
             "sampler": "class_balanced_weighted_random",
-            "teacher": "v6_ensemble+subheads",
+            "objective": "cross_entropy_hard_labels",
             "split_seed": args.split_seed,
-            "clean_list": args.clean_list or "none",
+            "train_source": data.train_source,
+            "n_train": len(train_idx),
+            "n_val": len(val_idx),
+            "n_holdout": len(test_idx),
+            # Provenance: which holdout this number was actually earned against.
+            "holdout_fingerprint": data.holdout_fingerprint,
         })
 
         best_val_acc, best_state = 0.0, None
@@ -303,14 +304,13 @@ def main() -> None:
             model.train()
             running_loss = 0.0
 
-            for imgs, soft_labels, hard_labels in train_loader:
+            for imgs, labels in train_loader:
                 imgs = imgs.to(device)
-                soft_labels = soft_labels.to(device)
-                hard_labels = hard_labels.to(device)
+                labels = labels.to(device)
                 optimizer.zero_grad()
                 logits = model(imgs)
-                loss = distillation_loss(logits, soft_labels, hard_labels,
-                                          args.distill_temp, args.distill_alpha, cb_weights_dev)
+                loss = F.cross_entropy(logits, labels, weight=cb_weights_dev,
+                                       label_smoothing=args.label_smoothing)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
@@ -335,13 +335,10 @@ def main() -> None:
         ckpt_path = save_checkpoint(best_state, args.weights_dir, run.info.run_id)
         print(f"Saved student weights -> {ckpt_path}")
         test_acc = evaluate_hard(model, test_loader, device)
-        compression_gap_pp = (args.teacher_test_acc - test_acc) * 100
-        print(f"Best val acc: {best_val_acc:.4f}  Test acc: {test_acc:.4f}  "
-              f"Compression gap: {compression_gap_pp:.2f}pp")
+        print(f"Best val acc: {best_val_acc:.4f}  Holdout acc: {test_acc:.4f}")
         mlflow.log_metrics({
             "best_val_acc": best_val_acc,
             "test_acc": test_acc,
-            "compression_gap_pp": compression_gap_pp,
         })
 
         cm = confusion_matrix(model, test_loader, device, num_classes)
@@ -353,7 +350,7 @@ def main() -> None:
         fig, ax = plt.subplots(figsize=(22, 18))
         sns.heatmap(pd.DataFrame(cm_ordered, index=display_names, columns=display_names),
                     annot=True, fmt="d", cmap="Blues", annot_kws={"size": 7}, ax=ax)
-        ax.set_title(f"Confusion Matrix — Distillation Student (Test Set)  acc={test_acc:.4f}")
+        ax.set_title(f"Confusion Matrix — MobileNetV3 (frozen holdout)  acc={test_acc:.4f}")
         plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
         plt.setp(ax.get_yticklabels(), rotation=0, fontsize=8)
         fig.tight_layout()
@@ -375,11 +372,15 @@ def main() -> None:
             name="model",  # if this errors on an older client: change to artifact_path="model"
             signature=signature,
             input_example=example_input.numpy(),
-            serialization_format="pickle",   # <-- add this; avoids pt2 (needs torch>=2.4), matches v1
+            serialization_format="pickle",   # avoids pt2 (needs torch>=2.4), matches v1
         )
 
     mv = mlflow.register_model(model_info.model_uri, MODEL_NAME)
     print(f"Registered {MODEL_NAME} v{mv.version} — challenger only, @champion unchanged")
+    if args.version_out:
+        Path(args.version_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.version_out).write_text(mv.version)
+        print(f"Wrote challenger version -> {args.version_out}")
 
 
 if __name__ == "__main__":

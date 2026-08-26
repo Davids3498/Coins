@@ -14,20 +14,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+from coin_clf.hashing import file_hash
 from splits import DatasetSplits, carve
-
-
-def file_hash(path: Path, chunk_size: int = 1 << 20) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def check(splits: DatasetSplits) -> bool:
@@ -74,13 +66,16 @@ def main() -> None:
     p.add_argument("--manifest", help="load a saved manifest instead of re-carving from scratch")
     p.add_argument("--clean-list", default=None,
                     help="clean_duplicates.py survivor list to filter through before carving "
-                         "(ignored if --manifest is given)")
+                         "(default: data/clean_files.txt; ignored if --manifest is given)")
+    p.add_argument("--allow-raw-tree", action="store_true",
+                    help="carve the raw, uncleaned tree -- expected to report leakage")
     args = p.parse_args()
 
     if args.manifest:
         splits = DatasetSplits.load(args.manifest, data_dir=args.data_dir)
     else:
-        splits = carve(args.data_dir, clean_list=args.clean_list)
+        splits = carve(args.data_dir, clean_list=args.clean_list,
+                       allow_raw_tree=args.allow_raw_tree)
     sizes = splits.sizes
     print(f"Checking {sum(sizes.values())} images: "
           f"train={sizes['train']} holdout={sizes['holdout']} future_pool={sizes['future_pool']}")
