@@ -20,6 +20,9 @@ under validate_batch() if and only if clean_duplicates.py would also call them d
 Width/height/mode come from coin_clf.image_meta for the same reason: the serving layer's
 prediction log reads image metadata too, and the gate's notion of an image's mode and the
 monitoring layer's must be one notion, not two that happen to agree today.
+
+The `readable` check uses image_meta.decodes (a full decode), NOT the header parse that produces
+the metadata above. See _build_frame -- the two are deliberately different strengths.
 """
 from __future__ import annotations
 
@@ -32,7 +35,7 @@ from typing import Iterable
 import pandas as pd
 
 from coin_clf.hashing import file_hash
-from coin_clf.image_meta import metadata_from_path
+from coin_clf.image_meta import decodes, metadata_from_path
 
 DEFAULT_MIN_DIM = 32
 DEFAULT_MAX_CLASS_SHARE = 0.5  # one class filling more than half a batch is "wildly over-represented"
@@ -81,7 +84,20 @@ def _build_frame(batch: Iterable[tuple[str | Path, str]]) -> pd.DataFrame:
     rows = []
     for path, label in batch:
         path = Path(path)
-        meta = metadata_from_path(path)  # None == unreadable/corrupt
+        meta = metadata_from_path(path)  # header parse: width/height/mode, None if unopenable
+
+        # `readable` is a FULL decode, not `meta is not None`. PIL's verify() -- which
+        # metadata_from_path uses -- validates the header and stops, so a JPEG truncated mid-scan
+        # opens fine and reports its real width, height and mode. This gate exists to stop bad
+        # data entering the retraining pipeline; reporting "readable" for a file that raises
+        # OSError the moment a DataLoader touches it is the check succeeding on precisely the
+        # case it was built to catch.
+        #
+        # Cost is why this was ever in question. Measured: the full decode is ~0.2ms/image over
+        # the real 57,792-image tree, and validate_batch END TO END (hash + metadata + decode)
+        # runs 0.44ms/image on 224x224 inputs -- about 2.2s for a 5,000-image batch, inside a DAG
+        # task that already runs for minutes. metadata_from_path stays cheap for the serving
+        # path, which decodes the upload itself anyway and must not pay for this twice.
         rows.append({
             "path": path,
             "label": label,
@@ -89,12 +105,13 @@ def _build_frame(batch: Iterable[tuple[str | Path, str]]) -> pd.DataFrame:
             "height": meta.height if meta else None,
             "mode": meta.mode if meta else None,
             "hash": file_hash(path),
-            "readable": meta is not None,
+            "readable": decodes(path),
         })
     return pd.DataFrame(rows, columns=["path", "label", "width", "height", "mode", "hash", "readable"])
 
 
 def _check_readable(frame: pd.DataFrame) -> CheckResult:
+    """Fails on anything that does not survive a full decode -- truncation included."""
     bad = frame.loc[~frame["readable"], "path"]
     return CheckResult("readable", bad.empty, f"{len(bad)} unreadable/corrupt image(s)", tuple(bad))
 

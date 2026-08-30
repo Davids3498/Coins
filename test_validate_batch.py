@@ -4,12 +4,14 @@ Real tiny images are written to tmp_path (not fakes) because the readable/mode/d
 actually open and decode files with PIL -- an empty or fake file would trip the "corrupt" check
 for every fixture, not just the one meant to.
 """
+import random
 import shutil
 
 import pytest
 from PIL import Image
 
 from coin_clf.hashing import file_hash
+from coin_clf.image_meta import decodes, metadata_from_path
 from coin_clf.validate_batch import validate_batch
 
 KNOWN_CLASSES = {"AUGUSTUS", "NERO", "TRAJAN", "HADRIAN", "VESPASIAN"}
@@ -53,6 +55,70 @@ def test_corrupt_file_trips_only_readable_check(tmp_path):
     assert failed_names(report) == {"readable"}
     readable = next(c for c in report.checks if c.name == "readable")
     assert corrupt in readable.offending_paths
+
+
+def make_truncated_image(path, keep=0.5):
+    """A JPEG whose HEADER survives but whose scan data is cut short.
+
+    Noise, not a solid colour, and that matters: a flat 64x64 JPEG compresses to ~693 bytes, of
+    which the header is most of it, so truncating one destroys the header and every reader
+    rejects it -- including the weak one, which makes it useless for proving anything. Noise
+    compresses to ~2.9 KB, so half the file is still well past the header. The assertion below
+    pins that property rather than trusting it.
+    """
+    img = Image.new("RGB", (64, 64))
+    rng = random.Random(20260831)
+    img.putdata([(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(64 * 64)])
+    img.save(path, format="JPEG")
+
+    raw = path.read_bytes()
+    path.write_bytes(raw[: int(len(raw) * keep)])
+
+    assert metadata_from_path(path) is not None, (
+        "truncated too far -- the header is gone, so this fixture no longer isolates the "
+        "header-parse-vs-full-decode distinction it exists to test"
+    )
+    return path
+
+
+def test_truncated_file_trips_only_readable_check(tmp_path):
+    """The case the gate used to pass.
+
+    A JPEG cut mid-scan keeps an intact header, so PIL's verify() accepts it and reports its real
+    64x64 RGB metadata -- `readable` used to be derived from exactly that and called the file
+    fine. It is not: a DataLoader raises OSError on it mid-epoch. Only a full decode sees it.
+
+    Asserting == {"readable"} pins the other half too: on paper the file is still a valid RGB
+    64x64 image, so no other check should fire on it.
+    """
+    truncated = make_truncated_image(tmp_path / "truncated.jpg")
+    batch = [
+        (make_image(tmp_path / "a.jpg", color=(1, 1, 1)), "AUGUSTUS"),
+        (make_image(tmp_path / "b.jpg", color=(2, 2, 2)), "NERO"),
+        (truncated, "TRAJAN"),
+    ]
+    report = validate_batch(batch, KNOWN_CLASSES)
+
+    assert report.is_valid is False
+    assert failed_names(report) == {"readable"}
+    readable = next(c for c in report.checks if c.name == "readable")
+    assert truncated in readable.offending_paths
+
+
+def test_header_parse_and_full_decode_disagree_on_truncation(tmp_path):
+    """Guards the distinction itself, not just the outcome.
+
+    metadata_from_path stays cheap for the serving path, which decodes every upload anyway;
+    decodes() is the strict one the gate uses. If these two ever agree on a truncated file,
+    someone has changed one of them, and this failing is how they find out -- rather than the two
+    predicates quietly collapsing into one and serving paying for a full decode per request.
+    """
+    truncated = make_truncated_image(tmp_path / "truncated.jpg")
+
+    meta = metadata_from_path(truncated)
+    assert meta is not None, "header parse should still succeed -- that is the whole problem"
+    assert (meta.width, meta.height, meta.mode) == (64, 64, "RGB")
+    assert decodes(truncated) is False
 
 
 def test_grayscale_trips_only_rgb_mode_check(tmp_path):
