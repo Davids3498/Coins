@@ -1,0 +1,206 @@
+# verify_data_integrity.py -- full run over the real tree
+# host:    Linux 6.18.33.2-microsoft-standard-WSL2
+# python:  Python 3.10.12
+# commit:  5072ccc (+ staged working tree)
+# date:    2026-08-31T00:34:24+03:00
+# command: PYTHONPATH=src python3 verify_data_integrity.py --jobs 8
+
+
+==============================================================================================
+SECTION 0 -- INPUTS (claims under test) + FRESH HASHING OF THE REAL TREE
+==============================================================================================
+  data_dir             /home/david/coin/data/FOR_TRAINNING  OK
+  clean_list           /home/david/coin/data/clean_files.txt  OK
+  manifest             /home/david/coin/data/splits_manifest.json  OK
+  active_train_list    /home/david/coin/data/active_train.txt  OK
+  cursor_file          /home/david/coin/data/future_pool_cursor.json  OK
+  quarantine_dir       /home/david/coin/data/quarantine  OK
+
+  globbing /home/david/coin/data/FOR_TRAINNING/*/side_a/*.jpg -> 57792 files
+  hashing all 57792 files fresh with 8 process(es) (nothing is read from drop_log.csv or any cache)...
+    tree: 10000/57792
+    tree: 20000/57792
+    tree: 30000/57792
+    tree: 40000/57792
+    tree: 50000/57792
+  hashed 57792 files in 1.1s
+
+==============================================================================================
+SECTION A -- PARTITION INTEGRITY (by content hash; filenames are never the key)
+==============================================================================================
+
+--- A1. exact size of each live partition ---------------------------------------------------
+    cursor file says 2 batch(es) of 5000 already released (10000 images)
+
+    TRAIN      (data/active_train.txt)                   files= 44674  unique_hashes= 44674  fp=b5ac7ab3f8eaed58
+    HOLDOUT    (manifest splits.holdout)                 files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    FUTURE-POOL unreleased (manifest tail)               files=  1559  unique_hashes=  1559  fp=ab5ed706d2ce4a06
+    future-pool released (already in train)              files= 10000  unique_hashes= 10000  fp=c87c99ce99d4fcac
+
+--- A2. pairwise content-hash disjointness (every count below must be 0) --------------------
+  [PASS] A2 hash-disjoint: TRAIN x HOLDOUT -- 0 colliding content hash(es)
+  [PASS] A2 hash-disjoint: TRAIN x FUTURE-POOL -- 0 colliding content hash(es)
+  [PASS] A2 hash-disjoint: HOLDOUT x FUTURE-POOL -- 0 colliding content hash(es)
+
+--- A3. clean_files.txt membership (every file in every live partition must be a survivor) --
+    clean_files.txt: 57792 lines, 57792 unique
+  [PASS] A3 all-in-clean-list: TRAIN -- 0 file(s) not on the clean list
+  [PASS] A3 all-in-clean-list: HOLDOUT -- 0 file(s) not on the clean list
+  [PASS] A3 all-in-clean-list: FUTURE-POOL -- 0 file(s) not on the clean list
+
+--- A4. arithmetic reconciliation + quarantine accounting -----------------------------------
+    training tree on disk                               57792  (57792 unique hashes -> 0 byte-duplicate files present)
+    clean_files.txt survivors                           57792  (57792 unique hashes)
+    quarantined out of the tree (quarantine)          4342
+
+    manifest train                                      34674
+    manifest holdout                                    11559
+    manifest future_pool                                11559
+    manifest total                                      57792
+
+    TRAIN  active_train.txt                             44674   (= manifest train 34674 + 10000 released)
+    HOLDOUT manifest                                    11559
+    FUTURE-POOL unreleased                               1559   (= manifest future 11559 - 10000 released)
+    ------------------------------------------------------------------
+    live total                                          57792
+    target (clean corpus)                               57792
+    gap                                                     0
+  [PASS] A4 manifest sums to the clean corpus -- 57792 vs 57792 survivors
+  [PASS] A4 train+holdout+unreleased == clean corpus -- 57792 vs 57792
+  [PASS] A4 active_train.txt == manifest train + released batches -- 0 symmetric difference
+  [PASS] A4 clean corpus is internally hash-unique -- 0 survivor(s) share bytes with another survivor
+  [PASS] A4 training tree on disk == clean corpus exactly (F1 quarantine) -- 0 file(s) differ between the tree and the clean list
+  [PASS] A4 training tree is internally hash-unique (no byte-duplicates left in place) -- 0 duplicate file(s) still in the tree
+  [PASS] A4 quarantine holds the condemned files, reversibly -- 4342 quarantined + 57792 clean = 62134 (expected 62134 originals)
+
+--- A5. label space on disk still matches the manifest that was carved from it --------------
+    tree       51 label(s) (after the GORDIAN II -> GORDIAN I merge)
+    manifest   51 label(s)
+  [PASS] A5 clean tree label space == manifest label_encoder -- 0 only on disk, 0 only in the manifest
+  [PASS] A5 label space is 51 classes -- 51 vs 51
+
+--- A6. every file in the clean corpus actually decodes (not just: exists and hashes) -------
+  full-decoding all 57792 files with 8 process(es) (header parsing is not enough -- see coin_clf.image_meta.decodes)...
+  decoded 57792 files in 11.6s -- 0 unreadable
+  [PASS] A6 every file in the training tree decodes end-to-end -- 0 unreadable file(s)
+
+==============================================================================================
+SECTION B -- EVERY DATA-LOADING ENTRY POINT, CALLED FOR REAL
+==============================================================================================
+
+--- B1. calling each entry point (size + content-hash fingerprint of what it returns) -------
+active_split: hashing 44674 train + 11559 holdout image(s) to verify content-hash disjointness...
+active_split: OK -- 44674 unique train hashes, 11559 unique holdout hashes, 0 collisions
+active_split: hashing 34674 train + 11559 holdout image(s) to verify content-hash disjointness...
+active_split: OK -- 34674 unique train hashes, 11559 unique holdout hashes, 0 collisions
+    discover_dataset(data_dir)  [clean by default]       files= 57792  unique_hashes= 57792  fp=4f80bf2c29948027
+    discover_dataset(data_dir, allow_raw_tree=True)      files= 57792  unique_hashes= 57792  fp=4f80bf2c29948027
+    build_manifest_holdout(data_dir, manifest)           files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    load_holdout(data_dir, manifest)                     files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    load_holdout(data_dir, None)                         files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    active_split(active_train.txt).train_idx             files= 35739  unique_hashes= 35739  fp=6d5252b5b9376e54
+    active_split(active_train.txt).val_idx               files=  8935  unique_hashes=  8935  fp=e8ffef13cb343ae3
+    active_split(active_train.txt).test_idx              files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    active_split(from_manifest_train).train_idx          files= 27739  unique_hashes= 27739  fp=d9e52921228ffd69
+    active_split(from_manifest_train).val_idx            files=  6935  unique_hashes=  6935  fp=75f8b728adee8e31
+    active_split(from_manifest_train).test_idx           files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    DatasetSplits.load(manifest).train_idx               files= 34674  unique_hashes= 34674  fp=41713c8df1e91eb8
+    DatasetSplits.load(manifest).holdout_idx             files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    DatasetSplits.load(manifest).future_idx              files= 11559  unique_hashes= 11559  fp=2875452d1116a6ff
+    carve(data_dir).train_idx                            files= 34674  unique_hashes= 34674  fp=41713c8df1e91eb8
+    carve(data_dir).holdout_idx                          files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+    carve(data_dir).future_idx                           files= 11559  unique_hashes= 11559  fp=2875452d1116a6ff
+    release_batch: batches 0..1 already released         files= 10000  unique_hashes= 10000  fp=c87c99ce99d4fcac
+    release_batch: NEXT batch (2) the DAG would release  files=  1559  unique_hashes=  1559  fp=ab5ed706d2ce4a06
+    validate_batch reference set (active_train + holdout) files= 56233  unique_hashes= 56233  fp=e387656e1d4392cc
+    export.evaluate_int8_on_test_set loader              files= 11559  unique_hashes= 11559  fp=c47d3f321a0e13c2
+
+--- B1b. label space ------------------------------------------------------------------------
+  [PASS] B1b discover_dataset label space is 51 classes after GORDIAN merge -- clean=51
+  [PASS] B1b clean and raw-tree discovery now agree (tree == clean corpus) -- raw=57792 clean=57792
+
+--- B1c. data_dir aliasing (train.py's default path vs the DAG's) ---------------------------
+  [PASS] B1c FOR_TRAINNING symlink and data/FOR_TRAINNING discover the same files -- relpath sets differ
+
+--- B2. do all 'holdout' consumers return the IDENTICAL set? --------------------------------
+    canonical = build_manifest_holdout(data_dir, manifest)  (11559 files, fp=c47d3f321a0e13c2)
+
+    fp=c47d3f321a0e13c2  n= 11559  AGREES with canonical
+        - build_manifest_holdout(data_dir, manifest)
+          consumer: THE holdout -- evaluate, promote, train, export
+        - load_holdout(data_dir, manifest)
+          consumer: evaluate.py / promote.py --manifest
+        - load_holdout(data_dir, None)
+          consumer: bare programmatic evaluate_version(...) call
+        - active_split(active_train.txt).test_idx
+          consumer: train.py's own test_acc
+        - active_split(from_manifest_train).test_idx
+          consumer: train.py --train-from-manifest
+        - DatasetSplits.load(manifest).holdout_idx
+          consumer: check_split_leakage --manifest
+        - carve(data_dir).holdout_idx
+          consumer: splits.py CLI (re-carve)
+        - export.evaluate_int8_on_test_set loader
+          consumer: export.py --data-dir
+  [PASS] B2 every 'the holdout' consumer returns one identical set -- 1 distinct holdout definition(s) in live code
+
+--- B3. does any training path overlap the holdout by content hash? -------------------------
+  [PASS] B3 hash-disjoint from holdout: active_split(active_train.txt).train_idx -- 0 colliding content hash(es)
+  [PASS] B3 hash-disjoint from holdout: active_split(active_train.txt).val_idx -- 0 colliding content hash(es)
+  [PASS] B3 hash-disjoint from holdout: active_split(from_manifest_train).train_idx -- 0 colliding content hash(es)
+  [PASS] B3 hash-disjoint from holdout: active_split(from_manifest_train).val_idx -- 0 colliding content hash(es)
+  [PASS] B3 hash-disjoint from holdout: DatasetSplits.load(manifest).train_idx -- 0 colliding content hash(es)
+  [PASS] B3 hash-disjoint from holdout: carve(data_dir).train_idx -- 0 colliding content hash(es)
+  [PASS] B3 hash-disjoint from holdout: release_batch: batches 0..1 already released -- 0 colliding content hash(es)
+
+--- B4. does re-running splits.carve still reproduce the pinned manifest? -------------------
+  [PASS] B4 carve() reproduces manifest.train -- 0 file(s) differ
+  [PASS] B4 carve() reproduces manifest.holdout -- 0 file(s) differ
+  [PASS] B4 carve() reproduces manifest.future_pool -- 0 file(s) differ
+
+--- B5. DAG task -> entry point mapping (dags/retrain_coin_clf.py) --------------------------
+    release_batch  -> release_batch.py    => DatasetSplits.load(manifest).future_idx
+    validate       -> coin_clf.validate_batch => reference set (active_train+holdout)
+    train          -> train.py            => active_split(...)
+    evaluate       -> evaluate.py         => build_manifest_holdout [canonical]
+    promote        -> promote.py          => build_manifest_holdout [canonical]
+
+==============================================================================================
+SECTION C -- UNREACHABILITY OF THE RAW TREE AND THE RIVAL HOLDOUTS
+==============================================================================================
+
+--- C1. deleted symbols stay deleted (F2 -- the 12,427 and 11,382 rivals) -------------------
+  [PASS] C1 coin_clf.data.frozen_split no longer exists
+  [PASS] C1 coin_clf.data.build_test_dataset no longer exists
+  [PASS] C1 coin_clf.data.CoinDistilDataset no longer exists
+
+--- C2. missing clean list / manifest RAISES instead of falling back (F7) -------------------
+  [PASS] C2 resolve_clean_list(missing) raises RawTreeError -- got RawTreeError
+  [PASS] C2 resolve_manifest(missing) raises RawTreeError -- got RawTreeError
+  [PASS] C2 discover_dataset(missing clean list) raises RawTreeError -- got RawTreeError
+  [PASS] C2 build_manifest_holdout(missing manifest) raises RawTreeError -- got RawTreeError
+  [PASS] C2 active_split(missing active list) raises RawTreeError -- got RawTreeError
+
+--- C3. no scoring API can still select a different holdout (F5) ----------------------------
+  [PASS] C3 evaluate.load_holdout has no clean_list parameter
+  [PASS] C3 evaluate.evaluate_version has no clean_list parameter
+
+--- C4. no CLI still offers a raw-tree escape hatch -----------------------------------------
+  [PASS] C4 evaluate.py no longer accepts --clean-list
+  [PASS] C4 promote.py no longer accepts --clean-list
+  [PASS] C4 train.py no longer accepts --clean-list
+  [PASS] C4 train.py no longer accepts --distill-temp
+  [PASS] C4 train.py no longer accepts --distill-alpha
+  [PASS] C4 train.py no longer accepts --teacher-test-acc
+  [PASS] C4 splits.py exposes --allow-raw-tree as an explicit opt-in
+
+--- C5. the discarded teacher is unreachable from the training path -------------------------
+  [PASS] C5 train.py imports nothing from coin_clf.teacher -- []
+  [PASS] C5 train.py resolves no teacher/distillation identifier at runtime -- 0 tainted identifier(s)
+  [PASS] C5 coin_clf.teacher is imported by no live pipeline module
+
+==============================================================================================
+SUMMARY
+==============================================================================================
+  50/50 checks passed
+  ALL CHECKS PASSED

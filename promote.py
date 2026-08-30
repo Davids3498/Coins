@@ -17,12 +17,15 @@ comparison).
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 MODEL_NAME = "coin-classifier"
 CHAMPION_ALIAS = "champion"
-TRACKING_URI = "http://127.0.0.1:5000"
+# Env-overridable, matching app/main.py and drift_report.py: one way to point every
+# component at a tracking server, and a default that keeps the local setup working.
+TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 DEFAULT_MARGIN = 0.005  # challenger must clear the champion by >= this (0.5 pp) to promote
 
 

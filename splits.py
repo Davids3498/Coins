@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 

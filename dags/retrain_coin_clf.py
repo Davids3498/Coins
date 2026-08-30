@@ -52,7 +52,9 @@ PYTHON = "/usr/bin/python3"  # the python3.10 interpreter with torch/pandas/mlfl
 # deliberately NOT the bare `python3` on PATH (miniconda's base env, no torch). Airflow's own
 # venv/process never imports either interpreter's packages; this is purely what BashOperator
 # shells out to.
-PROJECT_ROOT = "/home/david/coin"
+# Overridable so the DAG file is importable (and parseable by CI / a second Airflow host) off
+# this one machine. The default keeps the deployed scheduler working with no env change.
+PROJECT_ROOT = os.environ.get("COIN_PROJECT_ROOT", "/home/david/coin")
 
 # One future-pool batch per DAG run. Must stay constant for as long as one future_pool_cursor.json
 # is in use -- the cursor counts batch NUMBERS, so changing this mid-stream silently redefines

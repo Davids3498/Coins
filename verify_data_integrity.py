@@ -39,6 +39,7 @@ import json
 import sys
 import time
 from collections import defaultdict
+from multiprocessing import Pool
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -46,11 +47,26 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from coin_clf.hashing import fingerprint, hash_many  # noqa: E402
+from coin_clf.image_meta import decodes  # noqa: E402
 
+# Defaults describing THE REAL TREE. Every one is overridable so this script can also be run
+# against a small synthetic tree (see tests/fixtures/make_tree.py) on a machine that does not
+# have the 51 GB dataset -- which is the only way any of it runs in CI. Absent the flags the
+# numbers below are exactly what they always were, so a bare run is unchanged.
+#
 # The batch size the DAG is pinned to; the cursor counts batch NUMBERS, so released-count
 # arithmetic is only meaningful against the same size that produced the cursor.
-DAG_BATCH_SIZE = 200
-CLEAN_CORPUS_EXPECTED = 57792  # what the reconciliation in A4 must land on
+#
+# This MUST equal dags/retrain_coin_clf.py's BATCH_SIZE. It said 200 while the DAG released 5000,
+# and with the cursor at 2 that credited 400 released images instead of 10,000 -- reported as
+# 9,600 phantom TRAIN x FUTURE-POOL hash collisions, a 9,600-image gap in the A4 reconciliation,
+# and a 9,600-file symmetric difference on active_train.txt. Three red checks, all measuring the
+# checker's own stale constant rather than anything about the data. Corrected to 5000, against
+# which the real tree reconciles exactly.
+DAG_BATCH_SIZE = 5000
+CLEAN_CORPUS_EXPECTED = 57792   # what the reconciliation in A4 must land on
+ORIGINALS_EXPECTED = 62134      # clean survivors + quarantined, before any file was condemned
+CLASSES_EXPECTED = 51           # label space after the GORDIAN II -> GORDIAN I merge
 
 
 # --------------------------------------------------------------------------------------------
@@ -123,6 +139,33 @@ def hash_tree(data_dir: Path, jobs: int) -> dict[str, str]:
     return out
 
 
+def undecodable(data_dir: Path, relpaths, jobs: int) -> list[str]:
+    """Relpaths whose bytes do NOT survive a full decode, in sorted order.
+
+    Separate sweep from hash_tree because hashing and decoding answer different questions. Every
+    other check in this file reasons about bytes: which files exist, which are byte-identical,
+    which partition each belongs to. A JPEG truncated mid-scan is present, is unique, is on the
+    clean list and is in the manifest -- it satisfies all of that and still cannot be read. It
+    surfaces as a crashed DataLoader mid-epoch, or as an image silently dropped from a batch.
+
+    coin_clf.image_meta.decodes is the definition (Image.open + load()), so the gate and this
+    report cannot disagree about what "readable" means. Note it is deliberately STRICTER than
+    metadata_from_path, which stops at verify() and accepts truncated files.
+    """
+    paths = [str(data_dir / r) for r in relpaths]
+    print(f"  full-decoding all {len(paths)} files with {jobs} process(es) "
+          f"(header parsing is not enough -- see coin_clf.image_meta.decodes)...")
+    t0 = time.time()
+    if jobs <= 1 or len(paths) < 64:
+        results = [(q, decodes(q)) for q in paths]
+    else:
+        with Pool(jobs) as pool:
+            results = list(zip(paths, pool.imap(decodes, paths, chunksize=64)))
+    bad = sorted(str(Path(q).relative_to(data_dir)) for q, ok in results if not ok)
+    print(f"  decoded {len(paths)} files in {time.time() - t0:.1f}s -- {len(bad)} unreadable")
+    return bad
+
+
 def hashes_of(relpaths, tree: dict[str, str]) -> set[str]:
     return {tree[r] for r in relpaths if r in tree}
 
@@ -172,7 +215,7 @@ def pair_collisions(a: dict, b: dict, tree: dict[str, str]) -> tuple[int, list[t
 # --------------------------------------------------------------------------------------------
 # SECTION A -- partition integrity
 # --------------------------------------------------------------------------------------------
-def section_a(cfg, tree: dict[str, str], rep: Report) -> dict:
+def section_a(cfg, tree: dict[str, str], rep: Report, jobs: int) -> dict:
     section("SECTION A -- PARTITION INTEGRITY (by content hash; filenames are never the key)")
 
     clean_relpaths = [l for l in cfg.clean_list.read_text().splitlines() if l.strip()]
@@ -186,11 +229,11 @@ def section_a(cfg, tree: dict[str, str], rep: Report) -> dict:
     cursor = 0
     if cfg.cursor_file.exists():
         cursor = json.loads(cfg.cursor_file.read_text())["next_batch"]
-    released = m_future[: cursor * DAG_BATCH_SIZE]
-    unreleased = m_future[cursor * DAG_BATCH_SIZE :]
+    released = m_future[: cursor * cfg.batch_size]
+    unreleased = m_future[cursor * cfg.batch_size :]
 
     sub("A1. exact size of each live partition")
-    print(f"    cursor file says {cursor} batch(es) of {DAG_BATCH_SIZE} already released "
+    print(f"    cursor file says {cursor} batch(es) of {cfg.batch_size} already released "
           f"({len(released)} images)")
     print()
     train = describe("TRAIN      (data/active_train.txt)", active_relpaths, tree)
@@ -247,16 +290,16 @@ def section_a(cfg, tree: dict[str, str], rep: Report) -> dict:
           f"   (= manifest future {len(m_future)} - {len(released)} released)")
     print(f"    {'-' * 66}")
     print(f"    live total                                        {live_total:>7}")
-    print(f"    target (clean corpus)                             {CLEAN_CORPUS_EXPECTED:>7}")
+    print(f"    target (clean corpus)                             {cfg.expect_clean_corpus:>7}")
     print(f"    gap                                               "
-          f"{live_total - CLEAN_CORPUS_EXPECTED:>7}")
+          f"{live_total - cfg.expect_clean_corpus:>7}")
 
     rep.check("A4 manifest sums to the clean corpus",
               len(m_train) + len(m_holdout) + len(m_future) == len(clean_set),
               f"{len(m_train) + len(m_holdout) + len(m_future)} vs {len(clean_set)} survivors")
     rep.check("A4 train+holdout+unreleased == clean corpus",
-              live_total == CLEAN_CORPUS_EXPECTED,
-              f"{live_total} vs {CLEAN_CORPUS_EXPECTED}")
+              live_total == cfg.expect_clean_corpus,
+              f"{live_total} vs {cfg.expect_clean_corpus}")
     rep.check("A4 active_train.txt == manifest train + released batches",
               set(active_relpaths) == set(m_train) | set(released),
               f"{len(set(active_relpaths) ^ (set(m_train) | set(released)))} symmetric difference")
@@ -272,9 +315,44 @@ def section_a(cfg, tree: dict[str, str], rep: Report) -> dict:
               raw_n == raw_unique_h,
               f"{raw_n - raw_unique_h} duplicate file(s) still in the tree")
     rep.check("A4 quarantine holds the condemned files, reversibly",
-              len(quarantined) > 0 and len(quarantined) + len(clean_set) == 62134,
+              len(quarantined) > 0
+              and len(quarantined) + len(clean_set) == cfg.expect_originals,
               f"{len(quarantined)} quarantined + {len(clean_set)} clean = "
-              f"{len(quarantined) + len(clean_set)} (expected 62134 originals)")
+              f"{len(quarantined) + len(clean_set)} (expected {cfg.expect_originals} originals)")
+
+    # ----------------------------------------------------------------------------------------
+    sub("A5. label space on disk still matches the manifest that was carved from it")
+    # A class folder that appeared AFTER the carve widens the label space silently: every index
+    # the manifest holds still resolves, the counts still reconcile, and the first thing that
+    # notices is _load_manifest raising deep inside training. Comparing the two label sets here
+    # turns that into a named failure in the report, before anything tries to build a loader.
+    from coin_clf.data import GORDIAN_MERGES, folder_label
+
+    tree_labels = {folder_label(Path(r).parts[0]) for r in clean_set}
+    tree_labels = {GORDIAN_MERGES.get(n, n) for n in tree_labels}  # same merge discover_dataset does
+    manifest_labels = set(manifest["label_encoder"])
+    only_disk = sorted(tree_labels - manifest_labels)
+    only_manifest = sorted(manifest_labels - tree_labels)
+    print(f"    tree     {len(tree_labels):>4} label(s) (after the GORDIAN II -> GORDIAN I merge)")
+    print(f"    manifest {len(manifest_labels):>4} label(s)")
+    rep.check("A5 clean tree label space == manifest label_encoder",
+              not only_disk and not only_manifest,
+              f"{len(only_disk)} only on disk, {len(only_manifest)} only in the manifest"
+              + (f" (e.g. on disk: {only_disk[0]})" if only_disk else "")
+              + (f" (e.g. in manifest: {only_manifest[0]})" if only_manifest else ""),
+              fail_detail="the label space drifted since the carve -- re-carve before training")
+    rep.check(f"A5 label space is {cfg.expect_classes} classes",
+              len(manifest_labels) == cfg.expect_classes,
+              f"{len(manifest_labels)} vs {cfg.expect_classes}")
+
+    # ----------------------------------------------------------------------------------------
+    sub("A6. every file in the clean corpus actually decodes (not just: exists and hashes)")
+    bad = undecodable(cfg.data_dir, sorted(set(tree)), jobs)
+    rep.check("A6 every file in the training tree decodes end-to-end",
+              not bad, f"{len(bad)} unreadable file(s)" + (f" (e.g. {bad[0]})" if bad else ""),
+              fail_detail="present, uniquely hashed, correctly partitioned -- and undecodable")
+    for r in bad[:5]:
+        print(f"        {r}")
 
     return {
         "clean_set": clean_set,
@@ -378,7 +456,7 @@ def section_b(cfg, tree: dict[str, str], a: dict, rep: Report, jobs: int) -> Non
            _idx_relpaths(recarve.filepaths, recarve.future_idx, dd))
 
     # -- release_batch.py: RECONSTRUCTED, never called (it appends + advances the cursor) ------
-    pool = sp.future_pool(DAG_BATCH_SIZE)
+    pool = sp.future_pool(cfg.batch_size)
     cursor = a["cursor"]
     rel_idx = pool.ingested_through(cursor - 1) if cursor > 0 else []
     record(f"release_batch: batches 0..{cursor - 1} already released", "train",
@@ -404,20 +482,26 @@ def section_b(cfg, tree: dict[str, str], a: dict, rep: Report, jobs: int) -> Non
         print_pool(d)
 
     sub("B1b. label space")
-    rep.check("B1b discover_dataset label space is 51 classes after GORDIAN merge",
-              nc_clean == 51, f"clean={nc_clean}")
+    rep.check(f"B1b discover_dataset label space is {cfg.expect_classes} classes "
+              f"after GORDIAN merge",
+              nc_clean == cfg.expect_classes, f"clean={nc_clean}")
     rep.check("B1b clean and raw-tree discovery now agree (tree == clean corpus)",
               le_raw == le_clean and len(fps_raw) == len(fps_clean),
               f"raw={len(fps_raw)} clean={len(fps_clean)}")
 
     sub("B1c. data_dir aliasing (train.py's default path vs the DAG's)")
-    alias = REPO_ROOT / "FOR_TRAINNING"
-    if alias.exists():
+    # The repo-root FOR_TRAINNING symlink is a property of THIS repo's layout, not of whatever
+    # tree --data-root points at, so it is only meaningful for a default run. Under --data-root
+    # it is skipped rather than silently compared against an unrelated directory.
+    alias = cfg.repo_alias
+    if alias is not None and alias.exists():
         fps_alias, *_ = discover_dataset(alias)
         rep.check("B1c FOR_TRAINNING symlink and data/FOR_TRAINNING discover the same files",
                   {str(p.relative_to(alias)) for p in fps_alias}
                   == {str(p.relative_to(dd)) for p in fps_clean},
                   "relpath sets differ")
+    elif alias is None:
+        rep.note("--data-root given: the repo-root FOR_TRAINNING alias is not under test")
     else:
         rep.note("no FOR_TRAINNING symlink at repo root")
 
@@ -573,24 +657,66 @@ def _imports_of(path: Path) -> set[str]:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", default=str(REPO_ROOT / "data" / "FOR_TRAINNING"))
-    p.add_argument("--clean-list", default=str(REPO_ROOT / "data" / "clean_files.txt"))
-    p.add_argument("--manifest", default=str(REPO_ROOT / "data" / "splits_manifest.json"))
-    p.add_argument("--active-train-list", default=str(REPO_ROOT / "data" / "active_train.txt"))
-    p.add_argument("--cursor-file", default=str(REPO_ROOT / "data" / "future_pool_cursor.json"))
-    p.add_argument("--quarantine-dir", default=str(REPO_ROOT / "data" / "quarantine"))
+    # --data-root relocates the whole set of inputs in one flag; the six path flags below still
+    # override individually. Default None means "the repo's own data/", i.e. no change at all.
+    p.add_argument("--data-root", default=None,
+                   help="directory holding FOR_TRAINNING/, clean_files.txt, splits_manifest.json, "
+                        "active_train.txt, future_pool_cursor.json and quarantine/ "
+                        "(default: <repo>/data)")
+    p.add_argument("--data-dir", default=None)
+    p.add_argument("--clean-list", default=None)
+    p.add_argument("--manifest", default=None)
+    p.add_argument("--active-train-list", default=None)
+    p.add_argument("--cursor-file", default=None)
+    p.add_argument("--quarantine-dir", default=None)
     p.add_argument("--jobs", type=int, default=8)
+
+    exp = p.add_argument_group(
+        "expected shape of the corpus",
+        "Defaults describe the real tree. A synthetic tree needs its own numbers, and pinning "
+        "them as flags keeps the real run's assertions exactly as strict as they were.")
+    exp.add_argument("--expect-clean-corpus", type=int, default=CLEAN_CORPUS_EXPECTED)
+    exp.add_argument("--expect-originals", type=int, default=ORIGINALS_EXPECTED)
+    exp.add_argument("--expect-classes", type=int, default=CLASSES_EXPECTED)
+    exp.add_argument("--batch-size", type=int, default=DAG_BATCH_SIZE)
     args = p.parse_args()
 
+    root = Path(args.data_root) if args.data_root else REPO_ROOT / "data"
+
+    def _p(explicit: str | None, *parts: str) -> Path:
+        return Path(explicit) if explicit else root.joinpath(*parts)
+
     class Cfg:
-        data_dir = Path(args.data_dir)
-        clean_list = Path(args.clean_list)
-        manifest = Path(args.manifest)
-        active_train_list = Path(args.active_train_list)
-        cursor_file = Path(args.cursor_file)
-        quarantine_dir = Path(args.quarantine_dir)
+        data_dir = _p(args.data_dir, "FOR_TRAINNING")
+        clean_list = _p(args.clean_list, "clean_files.txt")
+        manifest = _p(args.manifest, "splits_manifest.json")
+        active_train_list = _p(args.active_train_list, "active_train.txt")
+        cursor_file = _p(args.cursor_file, "future_pool_cursor.json")
+        quarantine_dir = _p(args.quarantine_dir, "quarantine")
+        # Only a default run has a repo-root alias to compare against (see B1c).
+        repo_alias = None if args.data_root else REPO_ROOT / "FOR_TRAINNING"
+        batch_size = args.batch_size
+        expect_clean_corpus = args.expect_clean_corpus
+        expect_originals = args.expect_originals
+        expect_classes = args.expect_classes
 
     cfg = Cfg()
+
+    # Section B calls entry points that resolve the clean list and manifest THEMSELVES, from
+    # coin_clf.data's repo-anchored defaults -- discover_dataset(dd), carve(dd), and
+    # evaluate.load_holdout, which by design (see C3) has no clean_list parameter at all. Under
+    # --data-root those would reach past the fixture and read the real repo's files, so the
+    # module defaults are re-pointed here to match.
+    #
+    # This does NOT weaken the no-fallback rule those defaults exist to enforce: resolve_clean_list
+    # and resolve_manifest still RAISE when the file is missing (C2 proves it, and it runs against
+    # these same values). What moves is where they look, not whether they insist.
+    if args.data_root or args.clean_list or args.manifest:
+        import coin_clf.data as _data_mod
+
+        _data_mod.DEFAULT_CLEAN_LIST = cfg.clean_list
+        _data_mod.DEFAULT_MANIFEST = cfg.manifest
+
     rep = Report()
 
     section("SECTION 0 -- INPUTS (claims under test) + FRESH HASHING OF THE REAL TREE")
@@ -601,7 +727,7 @@ def main() -> None:
     print()
     tree = hash_tree(cfg.data_dir, args.jobs)
 
-    a = section_a(cfg, tree, rep)
+    a = section_a(cfg, tree, rep, args.jobs)
     section_b(cfg, tree, a, rep, args.jobs)
     section_c(cfg, rep)
 

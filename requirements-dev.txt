@@ -1,0 +1,49 @@
+# Everything needed to run the test suite, ruff and mypy on a machine with no dataset, no GPU,
+# no MLflow server and no AWS credentials. This is the file CI installs; if a test needs a
+# package, it belongs here, not in someone's `pip install --user`.
+#
+# INSTALL ORDER MATTERS. CPU torch must come from the PyTorch CPU index FIRST:
+#
+#     pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
+#     pip install -r requirements-dev.txt
+#     pip install -e . --no-deps
+#
+# torch/torchvision are deliberately NOT listed below. pyproject.toml declares them as
+# dependencies of coin_clf, so a plain `pip install -e .` re-resolves them from PyPI and drags in
+# ~2.5 GB of nvidia-* CUDA wheels that no test can use. --no-deps keeps the CPU wheels installed
+# above; this file supplies everything --no-deps then skips.
+#
+# The numpy pin below is load-bearing, not cosmetic: the CPU-index torch install pulls numpy 2.x,
+# which torch 2.2.2 was not compiled against ("Failed to initialize NumPy: _ARRAY_API not found",
+# then every tensor op that crosses to numpy fails). requirements-serve.txt pins 1.26.4, so
+# installing this file after torch repairs that.
+
+# --- production surfaces under test ---------------------------------------------------------
+# app/main.py (fastapi, pillow, numpy, mlflow, boto3) and drift_report.py (evidently, fsspec).
+# Pulled in by reference so the tests can never be green against a different set of pins than
+# the serving image and the drift job actually ship.
+-r requirements-serve.txt
+-r requirements-monitoring.txt
+
+# --- pinned transitives the tests import directly ---------------------------------------------
+# These arrive anyway as dependencies of evidently/mlflow/coin_clf, but the tests `import` them
+# by name, so they are declared rather than inherited -- an unrelated bump upstream must not be
+# able to silently remove a direct test dependency.
+pandas==1.5.3               # test_drift_report.py builds frames directly
+scikit-learn==1.4.1.post1   # coin_clf.data.split_dataset -> train_test_split
+scipy==1.11.4               # sklearn/evidently numeric base; pinned per requirements-monitoring
+jinja2==3.1.4               # test_monitor_state.py renders the alert template
+requests==2.32.3            # monitor_state.py webhook, replay_traffic.py client
+
+# matplotlib/seaborn are NOT here. train.py and train_hard_labels.py import them at module scope,
+# but no test imports either module and mypy is scoped to src/coin_clf, so the suite is green
+# without them. (mlflow happens to pull matplotlib in anyway; that is incidental, not relied on.)
+
+# --- test / lint tooling ----------------------------------------------------------------------
+pytest==8.3.3
+httpx==0.27.0               # starlette's TestClient backend -- test_api.py, test_prediction_log.py.
+                            # Today it also arrives transitively (evidently -> litestar -> httpx);
+                            # declared anyway, because the tests import TestClient directly and
+                            # must not depend on the drift stack to keep working.
+ruff==0.8.4
+mypy==1.14.1

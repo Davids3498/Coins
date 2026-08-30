@@ -20,4 +20,50 @@ dependencies = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "." alongside "src" is deliberate. The nine root-level test_*.py modules import root modules
+# (promote, splits, drift_report, monitor_state, replay_traffic, app.main) and are NOT moved into
+# tests/ -- moving them would break those imports. Pinning both entries here makes that work by
+# configuration rather than by pytest's incidental rootdir insertion.
+pythonpath = ["src", "."]
+
+# Collection is pinned, not discovered. data/ is 51 GB, .dvc/ is a 44 GB cache and weights/ is
+# 6 GB -- walking them costs minutes and finds nothing. notebooks/ holds archived experiment
+# records that are not maintained code.
+norecursedirs = [".*", "data", "outputs", "weights", "notebooks", "mlflow"]
+
+# --strict-markers: an unregistered marker is an error, not a silent no-op. A typo'd
+# @pytest.mark.needs_dat would otherwise mark nothing and quietly run on a runner with no dataset,
+# which is precisely the failure CI exists to catch.
+addopts = "--strict-markers"
+
+# Nothing carries these yet -- every test in the suite today runs with no dataset and no GPU.
+# They are declared so the CI filter (-m "not needs_data and not needs_gpu") is a standing
+# contract: the next test that does need the real tree gets marked instead of getting deleted.
+markers = [
+    "needs_data: requires the real 57k-image tree on disk",
+    "needs_gpu: requires CUDA",
+]
+
+[tool.ruff]
+# notebooks/ is an archive of experiment records, not maintained code: 153 of the 169 findings
+# on this tree came from there (semicolons, unused imports in exploratory cells). Linting it
+# would make `ruff check .` permanently red and teach everyone to ignore the gate.
+exclude = ["notebooks"]
+
+[tool.ruff.lint]
+# E741 (`l` as a comprehension variable) is house style here, in the exact files that the three
+# leakage incidents came from -- coin_clf/data.py, verify_data_integrity.py, monitor_state.py.
+# Rewriting 11 sites in that code to satisfy a cosmetic rule is churn where churn is expensive.
+ignore = ["E741"]
+
+[tool.mypy]
+python_version = "3.10"
+# Third-party stubs are not installed in CI (torch/mlflow/evidently ship none, or partial ones).
+# This keeps the gate about THIS code rather than about the ecosystem's stub coverage.
+ignore_missing_imports = true
+
+# Scoped to src/coin_clf for now -- the shared library every other component imports, so it is
+# where a type error propagates furthest. The root scripts currently report 11 errors across 8
+# files (4 arg-type, 3 var-annotated, 2 import-untyped, 1 union-attr, 1 override); widening the
+# gate to cover them is a follow-up, not a blocker for turning CI on.
+files = ["src/coin_clf"]

@@ -26,7 +26,7 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, WeightedRandomSampler
 
-from coin_clf.hashing import DEFAULT_JOBS, file_hash, hash_many
+from coin_clf.hashing import DEFAULT_JOBS, hash_many
 from coin_clf.transforms import val_transform
 
 GORDIAN_MERGES = {"GORDIAN II": "GORDIAN I"}
@@ -276,7 +276,7 @@ def active_split(
           f"to verify content-hash disjointness...")
     train_hashes = hash_many([filepaths[i] for i in train_val_idx], jobs=jobs)
     holdout_hashes = hash_many([filepaths[i] for i in test_idx], jobs=jobs)
-    holdout_by_hash = {}
+    holdout_by_hash: dict[str, str] = {}
     for p, h in holdout_hashes.items():
         holdout_by_hash.setdefault(h, p)
     collisions = [(p, holdout_by_hash[h]) for p, h in train_hashes.items() if h in holdout_by_hash]
@@ -307,4 +307,11 @@ def class_balanced_weights(labels: torch.Tensor, num_classes: int, beta: float =
 
 def weighted_sampler(labels: torch.Tensor, weights: torch.Tensor, num_samples: int | None = None) -> WeightedRandomSampler:
     sample_weights = weights[labels]
-    return WeightedRandomSampler(sample_weights, num_samples=num_samples or len(labels), replacement=True)
+    # The stub declares Sequence[float], but WeightedRandomSampler calls torch.as_tensor() on
+    # this argument, so a Tensor is the intended input. Converting to a list purely to satisfy
+    # the stub would copy len(labels) floats for nothing.
+    return WeightedRandomSampler(
+        sample_weights,  # type: ignore[arg-type]
+        num_samples=num_samples or len(labels),
+        replacement=True,
+    )

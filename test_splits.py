@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from splits import Batch, DatasetSplits, FuturePool, carve
+from splits import Batch, DatasetSplits, carve
 
 PER_CLASS = 40  # -> holdout 8/class, future 8/class, train 24/class at the defaults
 # discover_dataset() unconditionally applies GORDIAN_MERGES (GORDIAN II -> GORDIAN I), so any

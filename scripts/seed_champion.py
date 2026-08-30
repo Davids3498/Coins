@@ -5,6 +5,8 @@ Run:      python seed_champion.py
 """
 from __future__ import annotations
 
+import os
+
 import mlflow
 import mlflow.pytorch
 import torch
@@ -14,7 +16,7 @@ from coin_clf.model import build_model
 
 # --- edit these ---
 CHECKPOINT_PATH: str = "path/to/your.pth"      # your fine-tuned state dict
-TRACKING_URI: str = "http://127.0.0.1:5000"
+TRACKING_URI: str = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 INPUT_SIZE: int = 224                          # MUST match your training/inference transform
 
 # --- stable ---

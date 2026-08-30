@@ -49,7 +49,9 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # --- module constants ---------------------------------------------------------------------
 PYTHON = "/usr/bin/python3"   # the interpreter with torch/pandas/mlflow -- see retrain_coin_clf.py
-PROJECT_ROOT = "/home/david/coin"
+# Overridable so the DAG file is importable (and parseable by CI / a second Airflow host) off
+# this one machine. The default keeps the deployed scheduler working with no env change.
+PROJECT_ROOT = os.environ.get("COIN_PROJECT_ROOT", "/home/david/coin")
 
 # Airflow puts the DAGS folder on sys.path, not the repo root, so monitor_state (a root-level
 # module, stdlib-only by design) needs this to be importable here.
