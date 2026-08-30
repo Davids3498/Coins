@@ -155,7 +155,11 @@ class PredictionLog:
                 "and is PREDICTION_LOG_PATH pointing at the same file?"
             )
 
-        where, params = "", []
+        # list[object]: this carries a `since` string, an int `limit`, or both -- sqlite3
+        # adapts each. Inferred from the [since] branch alone it would be list[str], and
+        # appending the limit below would be a type error.
+        where: str = ""
+        params: list[object] = []
         if since is not None:
             where, params = " WHERE ts >= ?", [since]
 

@@ -45,14 +45,19 @@ from coin_clf.model import build_model
 from coin_clf.transforms import train_transform, val_transform
 from checkpoint import save_checkpoint
 
+# Repo-relative, not machine-absolute: this file is run by the Airflow DAG, by hand, and (for
+# --help / arg parsing) by CI, each from a different working directory. Same anchor pattern as
+# verify_data_integrity.py and coin_clf.data.
+REPO_ROOT = Path(__file__).resolve().parent
+
 EXPERIMENT_NAME = "coin-classifier"
 MODEL_NAME = "coin-classifier"
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data-dir", default="/home/david/coin/data/FOR_TRAINNING")
-    p.add_argument("--weights-dir", default="/home/david/coin/weights")
+    p.add_argument("--data-dir", default=str(REPO_ROOT / "data" / "FOR_TRAINNING"))
+    p.add_argument("--weights-dir", default=str(REPO_ROOT / "weights"))
     p.add_argument("--labels-out", default=None,
                     help="default: <weights-dir>/coin_labels.json")
     p.add_argument("--num-classes", type=int, default=51)

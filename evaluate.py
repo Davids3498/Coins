@@ -13,6 +13,7 @@ re-scores live), but it makes the registry honest for humans reading the runs.
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Callable
 
 import mlflow
@@ -21,7 +22,9 @@ from mlflow.tracking import MlflowClient
 from torch.utils.data import DataLoader, Dataset
 
 MODEL_NAME = "coin-classifier"
-TRACKING_URI = "http://127.0.0.1:5000"
+# Env-overridable, matching app/main.py and drift_report.py: one way to point every
+# component at a tracking server, and a default that keeps the local setup working.
+TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 # Same name train.py logs, so a backfilled v1 lines up with trained challengers. Re-running
 # against a run that already has it appends another point (cosmetic — the gate reads none of
 # these). Point it at a distinct name if you'd rather keep eval numbers separate from training.

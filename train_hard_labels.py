@@ -61,6 +61,11 @@ from train import (  # noqa: E402
     prepare_data,
 )
 
+# Repo-relative, not machine-absolute -- same anchor pattern as train.py and
+# verify_data_integrity.py. Defined here rather than imported from train.py so this file
+# keeps working if that import list ever changes.
+REPO_ROOT = Path(__file__).resolve().parent
+
 EXPERIMENT_NAME = "coin-classifier"
 MODEL_NAME = "coin-classifier"
 
@@ -79,8 +84,8 @@ SMOKE_RUN_EPOCHS = 10
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data-dir", default="/home/david/coin/data/FOR_TRAINNING")
-    p.add_argument("--weights-dir", default="/home/david/coin/weights")
+    p.add_argument("--data-dir", default=str(REPO_ROOT / "data" / "FOR_TRAINNING"))
+    p.add_argument("--weights-dir", default=str(REPO_ROOT / "weights"))
     p.add_argument("--labels-out", default=None, help="default: <weights-dir>/coin_labels.json")
     p.add_argument("--num-classes", type=int, default=51)
     p.add_argument("--input-size", type=int, default=224)

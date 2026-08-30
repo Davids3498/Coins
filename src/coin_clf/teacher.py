@@ -13,7 +13,8 @@ class ArcFaceClassifier(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(n_cls, in_dim))
         nn.init.xavier_uniform_(self.weight)
-        self.scale = scale; self.margin = margin
+        self.scale = scale
+        self.margin = margin
 
     def forward(self, x, labels=None):
         x = F.normalize(x, dim=-1)

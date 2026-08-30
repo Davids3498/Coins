@@ -1,0 +1,98 @@
+# Merge gate. Everything here runs with no dataset, no GPU, no MLflow server and no AWS
+# credentials -- the same conditions a hosted runner actually has. Anything that needs the real
+# 57k-image tree or CUDA is marked (see [tool.pytest.ini_options] markers) and filtered out.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A second push to the same PR cancels the first: these jobs build a Docker image and install
+# ~2 GB of wheels, and there is no value in finishing a run whose commit is already superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default. Neither job writes to the repo, and the image job never pushes.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.10 deliberately: the same minor version serve.Dockerfile runs (python:3.10-slim) and
+      # the same one the Airflow DAGs shell out to. Testing on a different interpreter than the
+      # one that serves traffic is how a syntax-level difference reaches production untested.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-serve.txt
+            requirements-monitoring.txt
+
+      # CPU torch FIRST, from the PyTorch CPU index. pyproject.toml lists torch/torchvision as
+      # coin_clf dependencies, so installing the package without --no-deps re-resolves them from
+      # PyPI and pulls ~2.5 GB of nvidia-* CUDA wheels onto a runner with no GPU.
+      - name: Install CPU torch
+        run: |
+          python -m pip install -U pip
+          pip install torch==2.2.2 torchvision==0.17.2 \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install test environment
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
+
+      # Fails the job if a CUDA wheel slipped in -- that means the install order above broke and
+      # the runner is silently downloading gigabytes it cannot use.
+      - name: Assert the install stayed CPU-only
+        run: |
+          if pip list --format=freeze | grep -qi '^nvidia-'; then
+            echo "::error::nvidia-* wheels installed -- CPU torch install order regressed"
+            pip list --format=freeze | grep -i '^nvidia-'
+            exit 1
+          fi
+          python -c "import torch; assert torch.version.cuda is None, torch.version.cuda; print(torch.__version__)"
+
+      - name: ruff
+        run: ruff check .
+
+      # Scoped to src/coin_clf: the shared library every other component imports. The root
+      # scripts report 11 errors across 8 files today; widening is a follow-up.
+      - name: mypy
+        run: mypy src/coin_clf
+
+      # The env scrubbing is the actual contract: no AWS credentials, no reachable MLflow, no
+      # CUDA device, and a HOME with none of this developer's caches or config in it.
+      - name: pytest
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:1
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+            python -m pytest -q -m "not needs_data and not needs_gpu"
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the serving image
+        run: docker build -f serve.Dockerfile -t coin-classifier:ci .
+
+      # --network none is the whole point. app/main.py loads the @champion inside the FastAPI
+      # lifespan, NOT at import time, so the module must import with no MLflow server and no S3
+      # reachable. If anyone moves that load back to module scope, this container cannot resolve
+      # the registry and the job fails -- which is the only mechanical check that keeps the
+      # serving app importable (and therefore testable) without infrastructure.
+      - name: Import smoke test with no network
+        run: |
+          docker run --rm --network none --entrypoint python coin-classifier:ci \
+            -c "import app.main, coin_clf"

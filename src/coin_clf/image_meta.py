@@ -13,6 +13,9 @@ the gate keeps its pandas frame, serving keeps its slim image, and the extractio
 Two entry points, one definition of the metadata itself:
     image_metadata(img)      -- from an already-open PIL Image (serving: bytes in memory)
     metadata_from_path(path) -- open, verify, re-open (the gate: files on disk)
+
+and one separate, deliberately stricter predicate:
+    decodes(path)            -- full decode (verify_data_integrity: the tree on disk)
 """
 from __future__ import annotations
 
@@ -61,3 +64,25 @@ def metadata_from_path(path: str | Path) -> ImageMeta | None:
             return image_metadata(img)
     except UNREADABLE_EXCEPTIONS:
         return None
+
+
+def decodes(path: str | Path) -> bool:
+    """True iff the file decodes COMPLETELY. Stricter than metadata_from_path, on purpose.
+
+    Image.verify() -- what metadata_from_path uses -- parses the header and stops. A JPEG
+    truncated mid-scan still has an intact header, so verify() accepts it and reports its real
+    width/height/mode; only forcing the full decode with load() raises
+    "image file is truncated (N bytes not processed)".
+
+    That distinction is why this is a separate function rather than a change to
+    metadata_from_path. The serving path and validate_batch's frame want cheap metadata on every
+    upload; verify_data_integrity wants proof that every file in a training partition can
+    actually be read to the last byte, and pays a full decode per file to get it (~16s over the
+    real 57,792-image tree at 8 jobs).
+    """
+    try:
+        with Image.open(path) as img:
+            img.load()
+        return True
+    except UNREADABLE_EXCEPTIONS:
+        return False

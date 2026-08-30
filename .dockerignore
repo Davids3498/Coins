@@ -1,12 +1,22 @@
-# .dockerignore
-data/
-datasets/
-*.jpg
-*.png
-*.jpeg
-mlruns/
-mlartifacts/
-.git/
-__pycache__/
-*.pyc
-.venv/
+# .dockerignore -- ALLOWLIST, not a denylist.
+#
+# This file used to list what to exclude, and it fell behind the repo: it predated .venv-airflow
+# (170 MB), the DVC cache (44 GB) and weights/ (6 GB), so `docker build` was streaming a 50.5 GB
+# context to build a ~1 GB image. A denylist here is a standing bug -- it is wrong again the next
+# time anyone adds a big directory, and nothing fails loudly when it does.
+#
+# So: exclude everything, then re-include exactly the four paths serve.Dockerfile COPYs. A new
+# directory is ignored by default; a new COPY that needs something has to add it here, and the
+# build fails loudly if it forgets.
+
+*
+
+!app
+!src
+!pyproject.toml
+!requirements-serve.txt
+
+# Re-excluded AFTER the allowlist (last match wins) -- these live inside app/ and src/ and are
+# rebuilt in the image anyway.
+**/__pycache__
+**/*.pyc

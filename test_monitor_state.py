@@ -15,7 +15,7 @@ catches a broken Jinja expression, not just a reverted string.
 """
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
