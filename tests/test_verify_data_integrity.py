@@ -132,3 +132,42 @@ def test_corruption_is_caught_only_by_the_decode_check(tmp_path):
     failures = [l for l in proc.stdout.splitlines() if "[FAIL]" in l]
     assert len(failures) == 1, "expected exactly one failed check, got:\n" + "\n".join(failures)
     assert "A6 every file in the training tree decodes end-to-end" in failures[0]
+
+
+# --- the batch size has exactly one source ---------------------------------
+#
+# This number was duplicated: the checker declared 200 while dags/retrain_coin_clf.py released
+# 5000, and the arithmetic built on it reported three failures that were about the stale copy
+# rather than about the data. Correcting the copy would have fixed that run and left the
+# mechanism -- two constants that must agree, in files nobody edits together -- fully intact.
+# These tests fail if a second copy comes back.
+
+def test_batch_size_is_read_from_the_dag():
+    import verify_data_integrity as v
+
+    dag_text = v.RETRAIN_DAG.read_text()
+    declared = [l for l in dag_text.splitlines() if l.startswith("BATCH_SIZE")]
+    assert len(declared) == 1, f"expected one BATCH_SIZE in the DAG, got {declared}"
+
+    expected = int(declared[0].split("=")[1].split("#")[0].strip())
+    assert v.dag_batch_size() == expected
+
+
+def test_checker_declares_no_batch_size_of_its_own():
+    """A literal batch size back in this file means the duplication is back."""
+    import verify_data_integrity as v
+
+    src = Path(v.__file__).read_text()
+    assert "DAG_BATCH_SIZE" not in src, "the local copy of the DAG's batch size is back"
+
+
+def test_missing_dag_batch_size_raises_rather_than_guessing(tmp_path, monkeypatch):
+    """No silent default. A checker that invents this number reports confident wrong arithmetic."""
+    import verify_data_integrity as v
+
+    stub = tmp_path / "retrain_coin_clf.py"
+    stub.write_text("PROJECT_ROOT = '/nowhere'\n")   # a DAG with no BATCH_SIZE
+    monkeypatch.setattr(v, "RETRAIN_DAG", stub)
+
+    with pytest.raises(RuntimeError, match="no module-level BATCH_SIZE"):
+        v.dag_batch_size()
