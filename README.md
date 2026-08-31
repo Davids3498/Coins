@@ -87,14 +87,18 @@ above. `make champion` prints the version currently aliased, and
 
 ## Serving
 
-`app/main.py` loads the model from the MLflow registry —
-`models:/coin-classifier@champion`, the full `nn.Module`, not a state dict — in a
-FastAPI **lifespan** (startup), not at import. That is what lets the module be
-imported with no registry reachable, which is how the tests inject a fake bundle
-through `app.dependency_overrides` and how CI's `--network none` import smoke test
-works.
+`app/main.py` loads the model in a FastAPI **lifespan** (startup), not at import.
+That is what lets the module be imported with no registry reachable, which is how
+the tests inject a fake bundle through `app.dependency_overrides` and how CI's
+`--network none` import smoke test works.
 
-- `GET /health` — `status`, `device`, `num_classes`, `model_name`, `model_version`
+By default it loads from the MLflow registry — `models:/coin-classifier@champion`,
+the full `nn.Module`, not a state dict. `MODEL_SOURCE=local` instead loads a
+champion baked into the image at build time, which is what the Fargate deployment
+runs and the only thing that differs about it; see [Cloud deploy](#cloud-deploy).
+Both paths report the same registry version on `/health`.
+
+- `GET /health` — `status`, `device`, `num_classes`, `model_name`, `model_version`, `model_source`
 - `POST /predict?topk=N` — multipart image upload → `{model_version, predictions: [{label, probability}]}`
   - optional `X-Traffic-Source` header: a monitoring tag (the replay script sets
     it to separate a normal from a deliberately skewed batch). It changes nothing
@@ -113,8 +117,9 @@ the upload **before** `.convert("RGB")`, or every row would report `mode="RGB"`
 forever and the mode drift signal would be permanently dead.
 
 Configuration, all environment variables:
-`MLFLOW_TRACKING_URI=http://127.0.0.1:5000`, `MODEL_NAME=coin-classifier`,
-`MODEL_ALIAS=champion`, `LABELS_PATH=app/coin_labels.json`,
+`MODEL_SOURCE=registry` (`registry` | `local`), `MLFLOW_TRACKING_URI=http://127.0.0.1:5000`,
+`MODEL_NAME=coin-classifier`, `MODEL_ALIAS=champion`, `BAKED_MODEL_DIR=<repo>/model`
+(read only when `MODEL_SOURCE=local`), `LABELS_PATH=app/coin_labels.json`,
 `PREDICTION_LOG_PATH=<repo>/outputs/monitoring/predictions.db`.
 
 The container needs the tracking server (for the alias) and its artifact store
@@ -268,6 +273,152 @@ is to exercise the real serving path, decode and log write included. It is
 read-only with respect to pipeline state — it reads the future-pool cursor, never
 advances it, and never appends to `active_train.txt`.
 
+## Cloud deploy
+
+The serving container was provisioned on AWS Fargate with Terraform, verified against the local
+container, and destroyed — inside one session, for about 1.5 cents. `infra/` holds the HCL,
+`docs/terraform_run.txt` holds the terminal capture of all of it. **This is IaC that was run,
+not IaC that was written.** Nothing is left standing; the numbers below came off a real task.
+
+### What Terraform provisions
+
+19 resources in `us-east-1`, every one tagged `Project=coin-mlops` (via the provider's
+`default_tags`, so a resource added later is findable by default):
+
+| File | Resources |
+| --- | --- |
+| `network.tf` | VPC `10.20.0.0/16`, internet gateway, two public subnets across AZs, route table + associations, security group (in `8000/tcp`, all out) |
+| `ecr.tf` | ECR repository (`force_delete`, keep-1-image lifecycle policy) |
+| `ecs.tf` | cluster, Fargate task definition (0.5 vCPU / 1 GB, X86_64), service (`desired_count = 1`, `assign_public_ip = true`), CloudWatch log group at `retention_in_days = 1` |
+| `iam.tf` | ECS task execution role, GitHub OIDC provider, CI deploy role + policy |
+| `outputs.tf` | task public IP, ECR URL, cluster/service names, deploy role ARN |
+
+`./infra/destroy.sh` runs `terraform destroy -auto-approve` and then **asks AWS directly**
+whether anything survived — clusters, services, running tasks, tagged VPCs, NAT gateways,
+Elastic IPs, ECR repositories, log groups, IAM roles, the OIDC provider. It exits `2` if
+anything is found. `terraform destroy` reporting success is not proof: it only knows about
+resources in its own state, so a partial apply or an out-of-band change is invisible to it.
+
+### The deliberate omissions
+
+**No NAT gateway.** It bills ~$0.045/hr the moment it exists, plus $0.045/GB processed, whether
+or not anything is running — the single most likely way to overrun a small budget. It exists to
+give *private* subnets outbound internet. The task runs in a *public* subnet with a public IP
+and an internet-gateway route, which gives it outbound (ECR pull, CloudWatch) and inbound (the
+curl that proves it serves) for nothing. The public IPv4 that replaces it costs $0.005/hr —
+about 11× cheaper — and only while a task is running.
+
+**No load balancer.** An ALB is ~$16/month plus LCU charges, and buys a stable DNS name, TLS
+termination, and health-check-driven replacement. None of that is what this demonstrates.
+Traffic goes straight to the task's public IP. The cost, stated plainly: the IP changes every
+time ECS replaces the task, there is no TLS, and `/predict` is an unauthenticated upload open to
+`0.0.0.0/0`. All three are fine for a stack whose entire life is one apply, one curl, and one
+destroy. All three are wrong for anything that stays up.
+
+**Local state, gitignored.** An S3 backend with a DynamoDB lock table is the correct production
+answer and takes about fifteen lines. It is omitted because it is itself two resources that
+outlive `terraform destroy` — the bucket holding the state cannot be destroyed by the state it
+holds — and the contract here was that nothing remains. One operator, one machine, one apply at
+a time; the difference is invisible at this size and visible the moment a second person applies.
+
+### The champion-resolution tradeoff
+
+`app/main.py` selects its model source with `MODEL_SOURCE`, and it is the only thing that
+differs between the two deployments:
+
+- **`registry` (default, local).** Resolves `models:/coin-classifier@champion` against the
+  tracking server at startup. The alias is the source of truth: `promote.py` moves it and the
+  next restart serves the new model with no rebuild. That indirection is the point of having a
+  registry at all.
+- **`local` (cloud).** Loads a champion already exported into the image. `serve.Dockerfile`
+  **cannot start on Fargate** — the alias lookup and the artifact download both happen at
+  startup, and the tracking server is a local SQLite-backed process on a developer's machine
+  with no route from a task. So `serve-cloud.Dockerfile` starts `FROM` the serving image and
+  copies in the export.
+
+Freezing an alias throws away the indirection that made it useful, so the mitigation is
+provenance. `scripts/export_champion.py` writes `champion.json` beside the artifact recording
+the name, alias, **version**, run ID and export time; `app/main.py` reads the version from it,
+**refuses to start without it**, and reports it on `/health` alongside `model_source`. A cloud
+container that cannot name the champion it serves is an untraceable binary, and comparing its
+output to local output would prove nothing.
+
+**What running this for real needs: a reachable tracking server.** With one, the cloud task uses
+`serve.Dockerfile` unchanged, the second Dockerfile disappears, and the alias goes back to being
+the single source of truth in both places. The bake is a workaround for a missing piece of
+infrastructure, not an architecture — which is also why the CI deploy job fails loudly at the
+export step today rather than pretending otherwise.
+
+### CI → AWS auth: OIDC, no long-lived keys
+
+`.github/workflows/ci.yml` gained a `deploy` job that is **`workflow_dispatch` only** — gated
+twice, by the trigger and by `if: github.event_name == 'workflow_dispatch'`, plus a `confirm`
+input the operator must type. It starts a billable task; a merge must not be able to reach it.
+
+There is no `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` in this repository, in GitHub
+secrets, or on a developer's machine. The job requests a short-lived token from GitHub
+(`permissions: id-token: write`), `aws-actions/configure-aws-credentials@v4` exchanges it, and
+AWS returns credentials that expire with the job. The trust policy lives in `infra/iam.tf`, not
+in a console nobody can review, and is scoped to `repo:Davids3498/Coins:*` — no other
+repository, and no fork, can assume it. A leaked access key is valid until a human notices; a
+leaked OIDC token is valid for minutes and only for this repo.
+
+Permissions are split by who needs them. The **task execution role** gets ECR pull and
+CloudWatch Logs and *nothing else* — no S3, because the model is baked in and the running
+container never calls AWS. The application gets no task role at all. The **CI deploy role**
+additionally gets read on the MLflow artifact bucket, because the runner must download the
+champion before it can build the cloud image. That is the one permission here that is not
+self-evident, so it is called out rather than quietly added.
+
+### The parity result
+
+`docs/terraform_run.txt` is the full capture. The same image
+(`data/FOR_TRAINNING/05_NERO/side_a/image24113.jpg`) through three deployments:
+
+| | local, `registry` | local, `local` | **Fargate** |
+| --- | --- | --- | --- |
+| `model_version` | 10 | 10 | **10** |
+| `model_source` | `registry` | `local` | **`local`** |
+| top-1 label | NERO | NERO | **NERO** |
+| top-1 probability | 0.8328765630722046 | 0.8328765630722046 | **0.8328765034675598** |
+
+Same champion, same label, same top-3 ordering (`NERO`, `GORDIAN I`, `DIDIUS JULIANUS`).
+
+The two **local** paths are bit-identical, which is the result that matters for the bake:
+freezing the model into an image introduces exactly zero numerical drift. Local vs Fargate
+agrees to 7 significant figures (relative delta 7.2e-08), not bit-for-bit — and that gap is CPU
+microarchitecture, not the deployment. float32 convolution and GEMM kernels reassociate
+differently across SIMD widths, so a developer machine and a Fargate host reduce the same sums
+in a different order. It is attributable to hardware *precisely because* the two local paths
+matched exactly on one machine. Bit-identical float across CPUs would need deterministic kernels
+and a pinned thread count, which costs throughput and would prove nothing further.
+
+### Running it
+
+```bash
+python scripts/export_champion.py                      # needs `make mlflow` + S3 access
+docker build -f serve.Dockerfile       -t coin-classifier:latest .
+docker build -f serve-cloud.Dockerfile -t coin-classifier:cloud  .
+
+cd infra && terraform init
+terraform apply -target=aws_ecr_repository.app         # the repo must exist to push to
+# docker login / tag / push  (see docs/terraform_run.txt)
+terraform apply                                        # the rest; blocks until a task is RUNNING
+curl "$(terraform output -raw service_url)/health"
+
+cd .. && ./infra/destroy.sh                            # tears down, then proves it
+```
+
+Apply is two-phase because the task definition pins an ECR tag that does not exist until the
+image is pushed; a single apply leaves the service crash-looping on `CannotPullContainerError`.
+
+**Cost of the run above: ~$0.015.** The task lived 30.6 minutes (`14:02:43Z` → `14:33:21Z`) at
+$0.0246/hr for 0.5 vCPU / 1 GB plus $0.005/hr for the public IPv4; ECR storage stayed inside the
+500 MB free tier and CloudWatch ingested a few KB. Cost Explorer still reported `$0` with
+`Estimated=true` when queried an hour after teardown — CE lags usage by up to 24 hours — so that
+figure is derived from the metered timestamps and published us-east-1 rates, not read back off a
+settled bill.
+
 ## Engineering notes
 
 Three things that were wrong and what fixing them changed.
@@ -342,12 +493,17 @@ dags/          Airflow DAGs — retrain_coin_clf and monitor_coin_clf
 *.py at root   the pipeline CLIs — see "Root scripts" below
 tests/         the whole pytest suite, plus fixtures/make_tree.py (a ~60-image stand-in
                for the real tree, so verify_data_integrity.py can be exercised in CI)
-scripts/       one-off utilities (seed_champion.py)
+scripts/       one-off utilities — seed_champion.py, export_champion.py (freezes the
+               registry's @champion into build/champion/ for the cloud image)
+infra/         Terraform for the Fargate deploy, split by concern (network, ecr, ecs, iam,
+               outputs, variables) + destroy.sh, which tears down and then verifies
 notebooks/     archived model-development notebooks — history, not maintained code;
                excluded from ruff and pytest. They use absolute paths, because VS Code
                sets a notebook's cwd to its own directory
 docs/          reference material + the tracked integrity run; working notes are local-only
-.github/       CI workflow — the merge gate
+.github/       CI workflow — the merge gate, plus the manual-only deploy job
+serve.Dockerfile       the serving image; resolves @champion at startup, bakes in nothing
+serve-cloud.Dockerfile FROM the above + the exported champion; MODEL_SOURCE=local, for Fargate
 makefile       control panel: mlflow, airflow, build, serve, train, retrain, drift, health
 .airflow_env.sh  AIRFLOW_HOME / DAGs folder / port + the airflow venv, sourced by `make airflow`
 ```
@@ -361,6 +517,9 @@ data/          the dataset is gitignored and DVC-tracked (FOR_TRAINNING/, archiv
                future_pool_cursor.json, drop_log.csv
 weights/       all .pth / .onnx checkpoints
 mlflow/        local MLflow tracking store (mlflow.db)
+build/         champion/ — the exported model the cloud image bakes in (~24 MB), plus
+               anything setuptools leaves behind
+infra/*.tfstate  Terraform state and .terraform/ — local and gitignored, see "Cloud deploy"
 outputs/       generated artifacts — monitoring/ (prediction log, drift reports, verdicts,
                monitor_state.json), dag_runs/, gradcam_out/, misclassified/
 misc/          loose non-project images
@@ -439,6 +598,14 @@ report 11 errors, widening it is a follow-up), asserts no `nvidia-*` wheel slipp
 into the install, and in a second job builds the serving image and imports it with
 `--network none` — the mechanical check that the registry load stays inside the
 lifespan and the app stays importable without infrastructure.
+
+The workflow has a third job, `deploy`, which is **manual only** — `workflow_dispatch`
+plus an `if:` on the event, plus a `confirm` input the operator has to type. It
+builds and pushes the cloud image and forces a new ECS deployment, authenticating
+with OIDC rather than stored keys. Nothing on `push` or `pull_request` can reach
+it, because it starts a task that bills. See [Cloud deploy](#cloud-deploy) — and
+note it fails at the export step until a tracking server exists that a hosted
+runner can reach.
 
 Anything that would need the real 57,792-image tree or CUDA gets the `needs_data`
 / `needs_gpu` marker instead of being deleted; nothing carries either one today

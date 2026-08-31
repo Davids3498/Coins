@@ -8,6 +8,18 @@ on:
     branches: [master]
   pull_request:
 
+  # Manual trigger, and the ONLY way the deploy job below ever runs -- it is additionally gated
+  # on `if: github.event_name == 'workflow_dispatch'`, so a push or a merge cannot reach it.
+  # Deploying costs money for as long as the Fargate task runs; that must be a decision someone
+  # makes on purpose, not a side effect of merging a pull request.
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'deploy' to confirm you intend to start a billable Fargate task"
+        required: true
+        default: ""
+        type: string
+
 # A second push to the same PR cancels the first: these jobs build a Docker image and install
 # ~2 GB of wheels, and there is no value in finishing a run whose commit is already superseded.
 concurrency:
@@ -96,3 +108,154 @@ jobs:
         run: |
           docker run --rm --network none --entrypoint python coin-classifier:ci \
             -c "import app.main, coin_clf"
+
+  # ===========================================================================================
+  # deploy -- MANUAL ONLY. Never on push, never on pull_request.
+  # ===========================================================================================
+  #
+  # This job spends money: it starts a Fargate task that bills for as long as it runs. A merge
+  # must not be able to trigger it, so it is gated twice -- `workflow_dispatch` in the `on:`
+  # block above, and the `if:` below that refuses to run under any other event even though the
+  # workflow itself still runs on push and PR.
+  #
+  # AUTH IS OIDC, NOT KEYS. There is no AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY here, in
+  # repository secrets, or anywhere else in this repo. `id-token: write` lets the runner ask
+  # GitHub for a short-lived signed token; AWS validates it against GitHub's OIDC keys and
+  # returns credentials that die with the job. The role's trust policy (infra/iam.tf) only
+  # accepts tokens whose subject matches repo:Davids3498/Coins:*, so no other repository -- and
+  # no fork -- can assume it. A leaked long-lived key is valid until a human notices; there is
+  # no long-lived key to leak.
+  #
+  # PREREQUISITE THIS JOB CANNOT SATISFY ITSELF, stated plainly rather than discovered at
+  # runtime: building serve-cloud.Dockerfile needs build/champion/, which
+  # scripts/export_champion.py produces by resolving @champion against a tracking server and
+  # downloading the model from its artifact store. THIS PROJECT'S TRACKING SERVER IS A LOCAL
+  # PROCESS ON THE DEVELOPER'S MACHINE, BACKED BY SQLITE (see the makefile's `mlflow` target).
+  # A GitHub-hosted runner cannot reach it. Until a tracking server is hosted somewhere the
+  # runner can resolve, this job WILL FAIL at the "Resolve the champion" step -- deliberately,
+  # loudly, and before it has built or pushed anything. The alternative was a job that looks
+  # deployable and is not.
+  #
+  # To make it work: host the tracking server, set the MLFLOW_TRACKING_URI repository variable
+  # to its URL, and set AWS_DEPLOY_ROLE_ARN to the ci_deploy_role_arn Terraform output. The
+  # role already carries read access to the artifact bucket for exactly this step.
+  deploy:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+
+    # id-token: write is what makes OIDC possible at all -- without it the runner cannot request
+    # a token and configure-aws-credentials has nothing to exchange. contents: read is the
+    # checkout. Nothing here writes to the repository.
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY: coin-mlops
+      ECS_CLUSTER: coin-mlops-cluster
+      ECS_SERVICE: coin-mlops-svc
+      IMAGE_TAG: cloud
+
+    steps:
+      # Fail before doing anything expensive or slow. Every one of these is set by hand after
+      # `terraform apply`, and the failure mode without this step is a confusing error three
+      # minutes into a Docker build.
+      - name: Check the deploy is configured
+        run: |
+          missing=0
+          if [ -z "${{ vars.AWS_DEPLOY_ROLE_ARN }}" ]; then
+            echo "::error::Repository variable AWS_DEPLOY_ROLE_ARN is not set."
+            echo "  Set it to the ci_deploy_role_arn output of 'terraform apply' in infra/."
+            missing=1
+          fi
+          if [ -z "${{ vars.MLFLOW_TRACKING_URI }}" ]; then
+            echo "::error::Repository variable MLFLOW_TRACKING_URI is not set."
+            echo "  This job needs a tracking server the runner can reach to resolve @champion."
+            echo "  The project's default (http://127.0.0.1:5000) is a local SQLite-backed"
+            echo "  process and is NOT reachable from a hosted runner. See infra/ and the"
+            echo "  README's 'Cloud deploy' section."
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Deploy configuration present."
+
+      # A second human gate on top of workflow_dispatch: the operator must type the word, so a
+      # stray click on "Run workflow" cannot start a billable task.
+      - name: Confirm intent
+        run: |
+          if [ "${{ inputs.confirm }}" != "deploy" ]; then
+            echo "::error::Type 'deploy' in the confirm input to proceed. This job starts a"
+            echo "billable Fargate task; it does not run on a default-valued dispatch."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      # OIDC. Note there are no `aws-access-key-id` / `aws-secret-access-key` inputs -- the
+      # role-to-assume + id-token permission pair is the whole mechanism.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # mlflow and boto3 only: the export downloads an artifact and reads the registry. It does
+      # NOT load the model, so torch is not needed here and the ~2 GB install is skipped.
+      - name: Install export dependencies
+        run: pip install "mlflow==3.15.1" boto3
+
+      # The step that fails today, and the first one that would. It resolves the alias and pulls
+      # the model bytes from S3 (which is why the deploy role has read on the artifact bucket,
+      # and why the ECS task execution role does not).
+      - name: Resolve the champion and export it
+        env:
+          MLFLOW_TRACKING_URI: ${{ vars.MLFLOW_TRACKING_URI }}
+        run: |
+          python scripts/export_champion.py
+          echo "CHAMPION_VERSION=$(python -c "import json; print(json.load(open('build/champion/champion.json'))['version'])")" >> "$GITHUB_ENV"
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Base image first, then the cloud image FROM it. serve-cloud.Dockerfile defaults its
+      # BASE_IMAGE to coin-classifier:latest, so this order is load-bearing: build them the
+      # other way round and the cloud image is built on a stale base.
+      - name: Build the cloud image
+        run: |
+          docker build -f serve.Dockerfile       -t coin-classifier:latest .
+          docker build -f serve-cloud.Dockerfile -t coin-classifier:cloud  .
+
+      - name: Push to ECR
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker tag coin-classifier:cloud "$IMAGE"
+          docker push "$IMAGE"
+          echo "Pushed $IMAGE (champion v$CHAMPION_VERSION)"
+
+      # The task definition pins the :cloud tag, so the image the service runs changed the
+      # moment the push landed -- but ECS does not notice on its own. force-new-deployment is
+      # what makes it pull again. The service is configured 0/100 (infra/ecs.tf), so the old
+      # task drains before the new one starts and only one task is ever billed.
+      - name: Force a new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --query 'service.{service:serviceName,taskDef:taskDefinition}' \
+            --output table
+
+      - name: Wait for the service to stabilize
+        run: |
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "Service stable. Champion v$CHAMPION_VERSION is live."
+          echo "::notice::Deployed champion v$CHAMPION_VERSION. Run ./infra/destroy.sh when finished -- this task bills while it runs."

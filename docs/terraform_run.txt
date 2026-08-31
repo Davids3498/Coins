@@ -1,0 +1,1752 @@
+===============================================================================
+ Cloud deploy: provision -> verify -> destroy
+ Captured 2026-08-31T13:59:28Z  |  account 730335657236  |  region us-east-1
+ terraform 1.9.8
+===============================================================================
+
+### LOCAL BASELINE (what the cloud must match) ###############################
+
+$ make champion
+coin-classifier @champion -> v10
+
+$ docker run ... coin-classifier:latest   # MODEL_SOURCE=registry, MLflow reachable
+$ curl -s http://127.0.0.1:8010/health
+{
+    "status": "ok",
+    "device": "cpu",
+    "num_classes": 51,
+    "model_name": "coin-classifier",
+    "model_version": "10",
+    "model_source": "registry"
+}
+
+$ curl -s -X POST 'http://127.0.0.1:8010/predict?topk=3' -F 'file=@test_coin.jpg'
+  (data/FOR_TRAINNING/05_NERO/side_a/image24113.jpg)
+{
+    "model_version": "10",
+    "predictions": [
+        {
+            "label": "NERO",
+            "probability": 0.8328765630722046
+        },
+        {
+            "label": "GORDIAN I",
+            "probability": 0.023134902119636536
+        },
+        {
+            "label": "DIDIUS JULIANUS",
+            "probability": 0.018021423369646072
+        }
+    ]
+}
+
+$ docker run ... coin-classifier:cloud    # MODEL_SOURCE=local, NO MLflow, NO AWS creds
+$ curl -s http://127.0.0.1:8011/health
+{
+    "status": "ok",
+    "device": "cpu",
+    "num_classes": 51,
+    "model_name": "coin-classifier",
+    "model_version": "10",
+    "model_source": "local"
+}
+
+$ curl -s -X POST 'http://127.0.0.1:8011/predict?topk=3' -F 'file=@test_coin.jpg'
+{
+    "model_version": "10",
+    "predictions": [
+        {
+            "label": "NERO",
+            "probability": 0.8328765630722046
+        },
+        {
+            "label": "GORDIAN I",
+            "probability": 0.023134902119636536
+        },
+        {
+            "label": "DIDIUS JULIANUS",
+            "probability": 0.018021423369646072
+        }
+    ]
+}
+
+-> registry path and baked path are byte-identical offline. Same champion (v10),
+   same label, same probability to all 16 digits.
+
+### 1. terraform apply -- phase 1: ECR repository only ########################
+
+$ terraform apply -target=aws_ecr_repository.app -auto-approve
+
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # aws_ecr_repository.app will be created
+  + resource "aws_ecr_repository" "app" {
+      + arn                  = (known after apply)
+      + force_delete         = true
+      + id                   = (known after apply)
+      + image_tag_mutability = "MUTABLE"
+      + name                 = "coin-mlops"
+      + registry_id          = (known after apply)
+      + repository_url       = (known after apply)
+      + tags                 = {
+          + "Name" = "coin-mlops-ecr"
+        }
+      + tags_all             = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-ecr"
+          + "Project"   = "coin-mlops"
+        }
+
+      + image_scanning_configuration {
+          + scan_on_push = false
+        }
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + ecr_repository_url = (known after apply)
+aws_ecr_repository.app: Creating...
+aws_ecr_repository.app: Creation complete after 2s [id=coin-mlops]
+
+Warning: Resource targeting is in effect
+
+You are creating a plan with the -target option, which means that the result
+of this plan may not represent all of the changes requested by the current
+configuration.
+
+The -target option is not for routine use, and is provided only for
+exceptional situations such as recovering from errors or mistakes, or when
+Terraform specifically suggests to use it as part of an error message.
+
+Warning: Applied changes may be incomplete
+
+The plan was created with the -target option in effect, so some changes
+requested in the configuration may have been ignored and the output values
+may not be fully updated. Run the following command to verify that no other
+changes are pending:
+    terraform plan
+
+Note that the -target option is not suitable for routine use, and is provided
+only for exceptional situations such as recovering from errors or mistakes,
+or when Terraform specifically suggests to use it as part of an error
+message.
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+ecr_repository_url = "730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops"
+
+### 2. Build and push the cloud image #########################################
+
+$ python scripts/export_champion.py
+{
+  "model_name": "coin-classifier",
+  "alias": "champion",
+  "version": "10",
+  "run_id": "1aa64c2289eb41abb7e95d9fcdd21d30",
+  "source_uri": "models:/coin-classifier@champion",
+  "registry_source": "models:/m-b7829f93e9b545db8c18098f2cdb87cb",
+  "tracking_uri": "http://127.0.0.1:5000",
+  "exported_at": "2026-08-31T13:47:12+00:00"
+}
+
+$ docker build -f serve.Dockerfile      -t coin-classifier:latest .
+$ docker build -f serve-cloud.Dockerfile -t coin-classifier:cloud  .
+$ aws ecr get-login-password | docker login --username AWS --password-stdin 730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops
+$ docker tag coin-classifier:cloud 730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops:cloud
+$ docker push 730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops:cloud
+
+Login Succeeded
+4d20941e27cb: Pushed
+2a47cfdd4871: Pushed
+593a449bf439: Pushed
+6f9432833129: Pushed
+7c3445ada99a: Pushed
+cloud: digest: sha256:e746a26f898e3092d971185d3a5bfe4e2b60f05a977753c8b82157bec2ffa018 size: 2837
+
+### 3. terraform apply -- phase 2: everything else ############################
+
+$ terraform apply -auto-approve
+  (data.external.task_ip polls until a task is RUNNING with an ENI -- this is the
+   'wait for the service to stabilize' step, done inside apply)
+
+data.aws_iam_policy_document.ecs_tasks_assume: Reading...
+data.aws_availability_zones.available: Reading...
+aws_ecr_repository.app: Refreshing state... [id=coin-mlops]
+data.aws_iam_policy_document.ecs_tasks_assume: Read complete after 0s [id=1077804475]
+data.aws_availability_zones.available: Read complete after 0s [id=us-east-1]
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+ <= read (data resources)
+
+Terraform will perform the following actions:
+
+  # data.aws_iam_policy_document.ci_deploy will be read during apply
+  # (config refers to values not yet known)
+ <= data "aws_iam_policy_document" "ci_deploy" {
+      + id            = (known after apply)
+      + json          = (known after apply)
+      + minified_json = (known after apply)
+
+      + statement {
+          + actions   = [
+              + "ecr:GetAuthorizationToken",
+            ]
+          + resources = [
+              + "*",
+            ]
+          + sid       = "EcrAuth"
+        }
+      + statement {
+          + actions   = [
+              + "ecr:BatchCheckLayerAvailability",
+              + "ecr:BatchGetImage",
+              + "ecr:CompleteLayerUpload",
+              + "ecr:GetDownloadUrlForLayer",
+              + "ecr:InitiateLayerUpload",
+              + "ecr:PutImage",
+              + "ecr:UploadLayerPart",
+            ]
+          + resources = [
+              + "arn:aws:ecr:us-east-1:730335657236:repository/coin-mlops",
+            ]
+          + sid       = "EcrPush"
+        }
+      + statement {
+          + actions   = [
+              + "ecs:UpdateService",
+            ]
+          + resources = [
+              + (known after apply),
+            ]
+          + sid       = "EcsDeploy"
+        }
+      + statement {
+          + actions   = [
+              + "ecs:DescribeServices",
+              + "ecs:DescribeTaskDefinition",
+              + "ecs:DescribeTasks",
+              + "ecs:ListTasks",
+            ]
+          + resources = [
+              + "*",
+            ]
+          + sid       = "EcsRead"
+        }
+      + statement {
+          + actions   = [
+              + "s3:GetObject",
+              + "s3:ListBucket",
+            ]
+          + resources = [
+              + "arn:aws:s3:::davids-mlops-artifacts-8412",
+              + "arn:aws:s3:::davids-mlops-artifacts-8412/*",
+            ]
+          + sid       = "MlflowArtifactRead"
+        }
+    }
+
+  # data.aws_iam_policy_document.ci_deploy_assume will be read during apply
+  # (config refers to values not yet known)
+ <= data "aws_iam_policy_document" "ci_deploy_assume" {
+      + id            = (known after apply)
+      + json          = (known after apply)
+      + minified_json = (known after apply)
+
+      + statement {
+          + actions = [
+              + "sts:AssumeRoleWithWebIdentity",
+            ]
+
+          + condition {
+              + test     = "StringEquals"
+              + values   = [
+                  + "sts.amazonaws.com",
+                ]
+              + variable = "token.actions.githubusercontent.com:aud"
+            }
+          + condition {
+              + test     = "StringLike"
+              + values   = [
+                  + "repo:Davids3498/Coins:*",
+                ]
+              + variable = "token.actions.githubusercontent.com:sub"
+            }
+
+          + principals {
+              + identifiers = [
+                  + (known after apply),
+                ]
+              + type        = "Federated"
+            }
+        }
+    }
+
+  # data.external.task_ip will be read during apply
+  # (depends on a resource or a module with changes pending)
+ <= data "external" "task_ip" {
+      + id      = (known after apply)
+      + program = [
+          + "bash",
+          + "./scripts/task_public_ip.sh",
+        ]
+      + query   = {
+          + "cluster" = "coin-mlops-cluster"
+          + "region"  = "us-east-1"
+          + "service" = "coin-mlops-svc"
+        }
+      + result  = (known after apply)
+    }
+
+  # aws_cloudwatch_log_group.app will be created
+  + resource "aws_cloudwatch_log_group" "app" {
+      + arn               = (known after apply)
+      + id                = (known after apply)
+      + log_group_class   = (known after apply)
+      + name              = "/ecs/coin-mlops"
+      + name_prefix       = (known after apply)
+      + retention_in_days = 1
+      + skip_destroy      = false
+      + tags              = {
+          + "Name" = "coin-mlops-logs"
+        }
+      + tags_all          = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-logs"
+          + "Project"   = "coin-mlops"
+        }
+    }
+
+  # aws_ecr_lifecycle_policy.app will be created
+  + resource "aws_ecr_lifecycle_policy" "app" {
+      + id          = (known after apply)
+      + policy      = jsonencode(
+            {
+              + rules = [
+                  + {
+                      + action       = {
+                          + type = "expire"
+                        }
+                      + description  = "Keep only the most recent image"
+                      + rulePriority = 1
+                      + selection    = {
+                          + countNumber = 1
+                          + countType   = "imageCountMoreThan"
+                          + tagStatus   = "any"
+                        }
+                    },
+                ]
+            }
+        )
+      + registry_id = (known after apply)
+      + repository  = "coin-mlops"
+    }
+
+  # aws_ecs_cluster.main will be created
+  + resource "aws_ecs_cluster" "main" {
+      + arn      = (known after apply)
+      + id       = (known after apply)
+      + name     = "coin-mlops-cluster"
+      + tags     = {
+          + "Name" = "coin-mlops-cluster"
+        }
+      + tags_all = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-cluster"
+          + "Project"   = "coin-mlops"
+        }
+
+      + setting {
+          + name  = "containerInsights"
+          + value = "disabled"
+        }
+    }
+
+  # aws_ecs_service.app will be created
+  + resource "aws_ecs_service" "app" {
+      + availability_zone_rebalancing      = "DISABLED"
+      + cluster                            = (known after apply)
+      + deployment_maximum_percent         = 100
+      + deployment_minimum_healthy_percent = 0
+      + desired_count                      = 1
+      + enable_ecs_managed_tags            = false
+      + enable_execute_command             = false
+      + iam_role                           = (known after apply)
+      + id                                 = (known after apply)
+      + launch_type                        = "FARGATE"
+      + name                               = "coin-mlops-svc"
+      + platform_version                   = (known after apply)
+      + scheduling_strategy                = "REPLICA"
+      + tags                               = {
+          + "Name" = "coin-mlops-svc"
+        }
+      + tags_all                           = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-svc"
+          + "Project"   = "coin-mlops"
+        }
+      + task_definition                    = (known after apply)
+      + triggers                           = (known after apply)
+      + wait_for_steady_state              = false
+
+      + network_configuration {
+          + assign_public_ip = true
+          + security_groups  = (known after apply)
+          + subnets          = (known after apply)
+        }
+    }
+
+  # aws_ecs_task_definition.app will be created
+  + resource "aws_ecs_task_definition" "app" {
+      + arn                      = (known after apply)
+      + arn_without_revision     = (known after apply)
+      + container_definitions    = jsonencode(
+            [
+              + {
+                  + environment      = [
+                      + {
+                          + name  = "BAKED_MODEL_DIR"
+                          + value = "/srv/model"
+                        },
+                      + {
+                          + name  = "MODEL_SOURCE"
+                          + value = "local"
+                        },
+                    ]
+                  + essential        = true
+                  + image            = "730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops:cloud"
+                  + logConfiguration = {
+                      + logDriver = "awslogs"
+                      + options   = {
+                          + awslogs-group         = "/ecs/coin-mlops"
+                          + awslogs-region        = "us-east-1"
+                          + awslogs-stream-prefix = "ecs"
+                        }
+                    }
+                  + name             = "coin-mlops"
+                  + portMappings     = [
+                      + {
+                          + containerPort = 8000
+                          + protocol      = "tcp"
+                        },
+                    ]
+                },
+            ]
+        )
+      + cpu                      = "512"
+      + enable_fault_injection   = (known after apply)
+      + execution_role_arn       = (known after apply)
+      + family                   = "coin-mlops"
+      + id                       = (known after apply)
+      + memory                   = "1024"
+      + network_mode             = "awsvpc"
+      + requires_compatibilities = [
+          + "FARGATE",
+        ]
+      + revision                 = (known after apply)
+      + skip_destroy             = false
+      + tags                     = {
+          + "Name" = "coin-mlops-taskdef"
+        }
+      + tags_all                 = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-taskdef"
+          + "Project"   = "coin-mlops"
+        }
+      + track_latest             = false
+
+      + runtime_platform {
+          + cpu_architecture        = "X86_64"
+          + operating_system_family = "LINUX"
+        }
+    }
+
+  # aws_iam_openid_connect_provider.github will be created
+  + resource "aws_iam_openid_connect_provider" "github" {
+      + arn             = (known after apply)
+      + client_id_list  = [
+          + "sts.amazonaws.com",
+        ]
+      + id              = (known after apply)
+      + tags            = {
+          + "Name" = "coin-mlops-github-oidc"
+        }
+      + tags_all        = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-github-oidc"
+          + "Project"   = "coin-mlops"
+        }
+      + thumbprint_list = [
+          + "6938fd4d98bab03faadb97b34396831e3780aea1",
+        ]
+      + url             = "https://token.actions.githubusercontent.com"
+    }
+
+  # aws_iam_role.ci_deploy will be created
+  + resource "aws_iam_role" "ci_deploy" {
+      + arn                   = (known after apply)
+      + assume_role_policy    = (known after apply)
+      + create_date           = (known after apply)
+      + force_detach_policies = false
+      + id                    = (known after apply)
+      + managed_policy_arns   = (known after apply)
+      + max_session_duration  = 3600
+      + name                  = "coin-mlops-ci-deploy"
+      + name_prefix           = (known after apply)
+      + path                  = "/"
+      + tags                  = {
+          + "Name" = "coin-mlops-ci-deploy"
+        }
+      + tags_all              = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-ci-deploy"
+          + "Project"   = "coin-mlops"
+        }
+      + unique_id             = (known after apply)
+
+      + inline_policy (known after apply)
+    }
+
+  # aws_iam_role.task_execution will be created
+  + resource "aws_iam_role" "task_execution" {
+      + arn                   = (known after apply)
+      + assume_role_policy    = jsonencode(
+            {
+              + Statement = [
+                  + {
+                      + Action    = "sts:AssumeRole"
+                      + Effect    = "Allow"
+                      + Principal = {
+                          + Service = "ecs-tasks.amazonaws.com"
+                        }
+                    },
+                ]
+              + Version   = "2012-10-17"
+            }
+        )
+      + create_date           = (known after apply)
+      + force_detach_policies = false
+      + id                    = (known after apply)
+      + managed_policy_arns   = (known after apply)
+      + max_session_duration  = 3600
+      + name                  = "coin-mlops-task-execution"
+      + name_prefix           = (known after apply)
+      + path                  = "/"
+      + tags                  = {
+          + "Name" = "coin-mlops-task-execution"
+        }
+      + tags_all              = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-task-execution"
+          + "Project"   = "coin-mlops"
+        }
+      + unique_id             = (known after apply)
+
+      + inline_policy (known after apply)
+    }
+
+  # aws_iam_role_policy.ci_deploy will be created
+  + resource "aws_iam_role_policy" "ci_deploy" {
+      + id          = (known after apply)
+      + name        = "coin-mlops-ci-deploy"
+      + name_prefix = (known after apply)
+      + policy      = (known after apply)
+      + role        = (known after apply)
+    }
+
+  # aws_iam_role_policy_attachment.task_execution will be created
+  + resource "aws_iam_role_policy_attachment" "task_execution" {
+      + id         = (known after apply)
+      + policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      + role       = "coin-mlops-task-execution"
+    }
+
+  # aws_internet_gateway.main will be created
+  + resource "aws_internet_gateway" "main" {
+      + arn      = (known after apply)
+      + id       = (known after apply)
+      + owner_id = (known after apply)
+      + tags     = {
+          + "Name" = "coin-mlops-igw"
+        }
+      + tags_all = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-igw"
+          + "Project"   = "coin-mlops"
+        }
+      + vpc_id   = (known after apply)
+    }
+
+  # aws_route_table.public will be created
+  + resource "aws_route_table" "public" {
+      + arn              = (known after apply)
+      + id               = (known after apply)
+      + owner_id         = (known after apply)
+      + propagating_vgws = (known after apply)
+      + route            = [
+          + {
+              + cidr_block                 = "0.0.0.0/0"
+              + gateway_id                 = (known after apply)
+                # (11 unchanged attributes hidden)
+            },
+        ]
+      + tags             = {
+          + "Name" = "coin-mlops-public-rt"
+        }
+      + tags_all         = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-public-rt"
+          + "Project"   = "coin-mlops"
+        }
+      + vpc_id           = (known after apply)
+    }
+
+  # aws_route_table_association.public[0] will be created
+  + resource "aws_route_table_association" "public" {
+      + id             = (known after apply)
+      + route_table_id = (known after apply)
+      + subnet_id      = (known after apply)
+    }
+
+  # aws_route_table_association.public[1] will be created
+  + resource "aws_route_table_association" "public" {
+      + id             = (known after apply)
+      + route_table_id = (known after apply)
+      + subnet_id      = (known after apply)
+    }
+
+  # aws_security_group.task will be created
+  + resource "aws_security_group" "task" {
+      + arn                    = (known after apply)
+      + description            = "Inbound 8000 from anywhere; all outbound."
+      + egress                 = [
+          + {
+              + cidr_blocks      = [
+                  + "0.0.0.0/0",
+                ]
+              + description      = "ECR pull, CloudWatch Logs"
+              + from_port        = 0
+              + ipv6_cidr_blocks = []
+              + prefix_list_ids  = []
+              + protocol         = "-1"
+              + security_groups  = []
+              + self             = false
+              + to_port          = 0
+            },
+        ]
+      + id                     = (known after apply)
+      + ingress                = [
+          + {
+              + cidr_blocks      = [
+                  + "0.0.0.0/0",
+                ]
+              + description      = "FastAPI /health and /predict"
+              + from_port        = 8000
+              + ipv6_cidr_blocks = []
+              + prefix_list_ids  = []
+              + protocol         = "tcp"
+              + security_groups  = []
+              + self             = false
+              + to_port          = 8000
+            },
+        ]
+      + name                   = "coin-mlops-task-sg"
+      + name_prefix            = (known after apply)
+      + owner_id               = (known after apply)
+      + revoke_rules_on_delete = false
+      + tags                   = {
+          + "Name" = "coin-mlops-task-sg"
+        }
+      + tags_all               = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-task-sg"
+          + "Project"   = "coin-mlops"
+        }
+      + vpc_id                 = (known after apply)
+    }
+
+  # aws_subnet.public[0] will be created
+  + resource "aws_subnet" "public" {
+      + arn                                            = (known after apply)
+      + assign_ipv6_address_on_creation                = false
+      + availability_zone                              = "us-east-1a"
+      + availability_zone_id                           = (known after apply)
+      + cidr_block                                     = "10.20.1.0/24"
+      + enable_dns64                                   = false
+      + enable_resource_name_dns_a_record_on_launch    = false
+      + enable_resource_name_dns_aaaa_record_on_launch = false
+      + id                                             = (known after apply)
+      + ipv6_cidr_block_association_id                 = (known after apply)
+      + ipv6_native                                    = false
+      + map_public_ip_on_launch                        = true
+      + owner_id                                       = (known after apply)
+      + private_dns_hostname_type_on_launch            = (known after apply)
+      + tags                                           = {
+          + "Name" = "coin-mlops-public-us-east-1a"
+        }
+      + tags_all                                       = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-public-us-east-1a"
+          + "Project"   = "coin-mlops"
+        }
+      + vpc_id                                         = (known after apply)
+    }
+
+  # aws_subnet.public[1] will be created
+  + resource "aws_subnet" "public" {
+      + arn                                            = (known after apply)
+      + assign_ipv6_address_on_creation                = false
+      + availability_zone                              = "us-east-1b"
+      + availability_zone_id                           = (known after apply)
+      + cidr_block                                     = "10.20.2.0/24"
+      + enable_dns64                                   = false
+      + enable_resource_name_dns_a_record_on_launch    = false
+      + enable_resource_name_dns_aaaa_record_on_launch = false
+      + id                                             = (known after apply)
+      + ipv6_cidr_block_association_id                 = (known after apply)
+      + ipv6_native                                    = false
+      + map_public_ip_on_launch                        = true
+      + owner_id                                       = (known after apply)
+      + private_dns_hostname_type_on_launch            = (known after apply)
+      + tags                                           = {
+          + "Name" = "coin-mlops-public-us-east-1b"
+        }
+      + tags_all                                       = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-public-us-east-1b"
+          + "Project"   = "coin-mlops"
+        }
+      + vpc_id                                         = (known after apply)
+    }
+
+  # aws_vpc.main will be created
+  + resource "aws_vpc" "main" {
+      + arn                                  = (known after apply)
+      + cidr_block                           = "10.20.0.0/16"
+      + default_network_acl_id               = (known after apply)
+      + default_route_table_id               = (known after apply)
+      + default_security_group_id            = (known after apply)
+      + dhcp_options_id                      = (known after apply)
+      + enable_dns_hostnames                 = true
+      + enable_dns_support                   = true
+      + enable_network_address_usage_metrics = (known after apply)
+      + id                                   = (known after apply)
+      + instance_tenancy                     = "default"
+      + ipv6_association_id                  = (known after apply)
+      + ipv6_cidr_block                      = (known after apply)
+      + ipv6_cidr_block_network_border_group = (known after apply)
+      + main_route_table_id                  = (known after apply)
+      + owner_id                             = (known after apply)
+      + tags                                 = {
+          + "Name" = "coin-mlops-vpc"
+        }
+      + tags_all                             = {
+          + "ManagedBy" = "terraform"
+          + "Name"      = "coin-mlops-vpc"
+          + "Project"   = "coin-mlops"
+        }
+    }
+
+Plan: 18 to add, 0 to change, 0 to destroy.
+
+Changes to Outputs:
+  + ci_deploy_role_arn = (known after apply)
+  + cluster_name       = "coin-mlops-cluster"
+  + log_group          = "/ecs/coin-mlops"
+  + service_name       = "coin-mlops-svc"
+  + service_url        = (known after apply)
+  + task_ip_status     = (known after apply)
+  + task_public_ip     = (known after apply)
+aws_ecr_lifecycle_policy.app: Creating...
+aws_iam_openid_connect_provider.github: Creating...
+aws_cloudwatch_log_group.app: Creating...
+aws_ecs_cluster.main: Creating...
+aws_iam_role.task_execution: Creating...
+aws_vpc.main: Creating...
+aws_iam_openid_connect_provider.github: Creation complete after 1s [id=arn:aws:iam::730335657236:oidc-provider/token.actions.githubusercontent.com]
+aws_ecr_lifecycle_policy.app: Creation complete after 1s [id=coin-mlops]
+data.aws_iam_policy_document.ci_deploy_assume: Reading...
+data.aws_iam_policy_document.ci_deploy_assume: Read complete after 0s [id=3104359687]
+aws_iam_role.ci_deploy: Creating...
+aws_iam_role.task_execution: Creation complete after 1s [id=coin-mlops-task-execution]
+aws_iam_role_policy_attachment.task_execution: Creating...
+aws_cloudwatch_log_group.app: Creation complete after 1s [id=/ecs/coin-mlops]
+aws_ecs_task_definition.app: Creating...
+aws_iam_role_policy_attachment.task_execution: Creation complete after 0s [id=coin-mlops-task-execution-20260831140119134200000001]
+aws_ecs_task_definition.app: Creation complete after 0s [id=coin-mlops]
+aws_iam_role.ci_deploy: Creation complete after 0s [id=coin-mlops-ci-deploy]
+aws_ecs_cluster.main: Still creating... [10s elapsed]
+aws_vpc.main: Still creating... [10s elapsed]
+aws_ecs_cluster.main: Creation complete after 11s [id=arn:aws:ecs:us-east-1:730335657236:cluster/coin-mlops-cluster]
+aws_vpc.main: Creation complete after 13s [id=vpc-03ec0a6cdc3a4fc62]
+aws_internet_gateway.main: Creating...
+aws_subnet.public[1]: Creating...
+aws_subnet.public[0]: Creating...
+aws_security_group.task: Creating...
+aws_internet_gateway.main: Creation complete after 1s [id=igw-048bf8ac4fdedc862]
+aws_route_table.public: Creating...
+aws_route_table.public: Creation complete after 2s [id=rtb-0b156c6412643ded6]
+aws_security_group.task: Creation complete after 4s [id=sg-037fc39ccb08f5430]
+aws_subnet.public[1]: Still creating... [14s elapsed]
+aws_subnet.public[0]: Still creating... [14s elapsed]
+aws_subnet.public[1]: Creation complete after 15s [id=subnet-0c3e2d7344fd48307]
+aws_subnet.public[0]: Creation complete after 15s [id=subnet-00c42e19067d20931]
+aws_route_table_association.public[0]: Creating...
+aws_route_table_association.public[1]: Creating...
+aws_ecs_service.app: Creating...
+aws_route_table_association.public[1]: Creation complete after 1s [id=rtbassoc-0ba00b99f290a98e5]
+aws_route_table_association.public[0]: Creation complete after 1s [id=rtbassoc-0d7009d98801b039f]
+aws_ecs_service.app: Creation complete after 2s [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc]
+data.aws_iam_policy_document.ci_deploy: Reading...
+data.external.task_ip: Reading...
+data.aws_iam_policy_document.ci_deploy: Read complete after 0s [id=2501062604]
+aws_iam_role_policy.ci_deploy: Creating...
+aws_iam_role_policy.ci_deploy: Creation complete after 1s [id=coin-mlops-ci-deploy:coin-mlops-ci-deploy]
+data.external.task_ip: Still reading... [10s elapsed]
+data.external.task_ip: Still reading... [20s elapsed]
+data.external.task_ip: Read complete after 32s [id=-]
+
+Apply complete! Resources: 18 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+ci_deploy_role_arn = "arn:aws:iam::730335657236:role/coin-mlops-ci-deploy"
+cluster_name = "coin-mlops-cluster"
+ecr_repository_url = "730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops"
+log_group = "/ecs/coin-mlops"
+service_name = "coin-mlops-svc"
+service_url = "http://100.54.47.64:8000"
+task_ip_status = "running"
+task_public_ip = "100.54.47.64"
+
+### 4. Wait for the service to stabilize ######################################
+
+$ aws ecs describe-services --cluster coin-mlops-cluster --services coin-mlops-svc
+-----------------------------------------------
+|              DescribeServices               |
++---------+-------------+----------+----------+
+| desired |   rollout   | running  | status   |
++---------+-------------+----------+----------+
+|  1      |  COMPLETED  |  1       |  ACTIVE  |
++---------+-------------+----------+----------+
+  container reachable 25s after apply returned
+
+### 5. curl /health on the Fargate task #######################################
+
+$ curl -s http://100.54.47.64:8000/health
+{
+    "status": "ok",
+    "device": "cpu",
+    "num_classes": 51,
+    "model_name": "coin-classifier",
+    "model_version": "10",
+    "model_source": "local"
+}
+
+### 6. curl /predict on the Fargate task -- THE PARITY CHECK ##################
+
+$ curl -s -X POST 'http://100.54.47.64:8000/predict?topk=3' -F 'file=@test_coin.jpg'
+  (same image as the local baseline: data/FOR_TRAINNING/05_NERO/side_a/image24113.jpg)
+{
+    "model_version": "10",
+    "predictions": [
+        {
+            "label": "NERO",
+            "probability": 0.8328765034675598
+        },
+        {
+            "label": "GORDIAN I",
+            "probability": 0.023134900256991386
+        },
+        {
+            "label": "DIDIUS JULIANUS",
+            "probability": 0.018021421507000923
+        }
+    ]
+}
+
+  PARITY RESULT
+  ---------------------------------------------------------------------------
+                         local (registry)      local (baked)        Fargate
+  model_version          10                    10                   10
+  model_source           registry              local                local
+  top-1 label            NERO                  NERO                 NERO
+  top-1 probability      0.8328765630722046    0.8328765630722046   0.8328765034675598
+  top-3 ordering         NERO, GORDIAN I, DIDIUS JULIANUS  (identical on all three)
+
+  Same champion, same label, same ranking. The two LOCAL paths are bit-identical,
+  which is the result that matters for the bake: freezing the model into the image
+  introduces exactly zero numerical drift.
+
+  Local vs Fargate agrees to 7 significant figures (relative delta 7.2e-08), not
+  bit-for-bit. That gap is CPU microarchitecture, not the deployment: float32 conv
+  and GEMM kernels reassociate differently across SIMD widths, so this developer
+  machine and the Fargate host reduce the same sums in a different order. It is
+  isolated to hardware precisely BECAUSE the two local paths matched bit-for-bit
+  on one machine. Bit-identical float across CPUs would need deterministic kernels
+  and a pinned thread count, which costs throughput and proves nothing extra here.
+
+### Task and log evidence (CLI -- the authoritative record) ###################
+
+$ aws ecs describe-tasks --cluster coin-mlops-cluster --tasks <arn>
+--------------------------------------------------------------------------------------------------------------------
+|                                                   DescribeTasks                                                  |
++-----------------+------------------------------------------------------------------------------------------------+
+|  az             |  us-east-1a                                                                                    |
+|  cpu            |  512                                                                                           |
+|  healthStatus   |  UNKNOWN                                                                                       |
+|  image          |  730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops:cloud                                 |
+|  imageDigest    |  sha256:e746a26f898e3092d971185d3a5bfe4e2b60f05a977753c8b82157bec2ffa018                       |
+|  lastStatus     |  RUNNING                                                                                       |
+|  launchType     |  FARGATE                                                                                       |
+|  memory         |  1024                                                                                          |
+|  platformVersion|  1.4.0                                                                                         |
+|  startedAt      |  2026-08-31T17:02:43.180000+03:00                                                              |
+|  taskArn        |  arn:aws:ecs:us-east-1:730335657236:task/coin-mlops-cluster/72c666401d164e85b0a5e0d936bf9dd4   |
++-----------------+------------------------------------------------------------------------------------------------+
+
+$ aws logs tail /ecs/coin-mlops
+2026-08-31T14:02:51.931000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     Started server process [1]
+2026-08-31T14:02:51.931000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     Waiting for application startup.
+2026-08-31T14:02:51.937000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 2026/08/31 14:02:51 WARNING mlflow.pytorch: Stored model version '2.2.2+cu121' does not match installed PyTorch version '2.2.2+cpu'
+2026-08-31T14:02:52.030000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     Application startup complete.
+2026-08-31T14:02:52.031000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-08-31T14:02:55.992000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     147.235.195.88:13195 - "GET /health HTTP/1.1" 200 OK
+2026-08-31T14:03:12.998000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     147.235.195.88:13225 - "GET /health HTTP/1.1" 200 OK
+2026-08-31T14:03:14.078000+00:00 ecs/coin-mlops/72c666401d164e85b0a5e0d936bf9dd4 INFO:     147.235.195.88:13231 - "POST /predict?topk=3 HTTP/1.1" 200 OK
+
+### 7. ./infra/destroy.sh #####################################################
+
+$ ./infra/destroy.sh
+
+==============================================================
+terraform destroy   (project=coin-mlops region=us-east-1)
+==============================================================
+[0m[1mdata.aws_iam_policy_document.ecs_tasks_assume: Reading...[0m[0m
+[0m[1mdata.aws_availability_zones.available: Reading...[0m[0m
+[0m[1maws_ecr_repository.app: Refreshing state... [id=coin-mlops][0m
+[0m[1maws_ecs_cluster.main: Refreshing state... [id=arn:aws:ecs:us-east-1:730335657236:cluster/coin-mlops-cluster][0m
+[0m[1maws_vpc.main: Refreshing state... [id=vpc-03ec0a6cdc3a4fc62][0m
+[0m[1maws_iam_openid_connect_provider.github: Refreshing state... [id=arn:aws:iam::730335657236:oidc-provider/token.actions.githubusercontent.com][0m
+[0m[1maws_cloudwatch_log_group.app: Refreshing state... [id=/ecs/coin-mlops][0m
+[0m[1mdata.aws_iam_policy_document.ecs_tasks_assume: Read complete after 0s [id=1077804475][0m
+[0m[1maws_iam_role.task_execution: Refreshing state... [id=coin-mlops-task-execution][0m
+[0m[1mdata.aws_availability_zones.available: Read complete after 1s [id=us-east-1][0m
+[0m[1maws_internet_gateway.main: Refreshing state... [id=igw-048bf8ac4fdedc862][0m
+[0m[1maws_subnet.public[0]: Refreshing state... [id=subnet-00c42e19067d20931][0m
+[0m[1maws_subnet.public[1]: Refreshing state... [id=subnet-0c3e2d7344fd48307][0m
+[0m[1maws_security_group.task: Refreshing state... [id=sg-037fc39ccb08f5430][0m
+[0m[1maws_route_table.public: Refreshing state... [id=rtb-0b156c6412643ded6][0m
+[0m[1maws_route_table_association.public[0]: Refreshing state... [id=rtbassoc-0d7009d98801b039f][0m
+[0m[1maws_route_table_association.public[1]: Refreshing state... [id=rtbassoc-0ba00b99f290a98e5][0m
+[0m[1maws_ecr_lifecycle_policy.app: Refreshing state... [id=coin-mlops][0m
+[0m[1mdata.aws_iam_policy_document.ci_deploy_assume: Reading...[0m[0m
+[0m[1mdata.aws_iam_policy_document.ci_deploy_assume: Read complete after 0s [id=3104359687][0m
+[0m[1maws_iam_role.ci_deploy: Refreshing state... [id=coin-mlops-ci-deploy][0m
+[0m[1maws_iam_role_policy_attachment.task_execution: Refreshing state... [id=coin-mlops-task-execution-20260831140119134200000001][0m
+[0m[1maws_ecs_task_definition.app: Refreshing state... [id=coin-mlops][0m
+[0m[1maws_ecs_service.app: Refreshing state... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc][0m
+[0m[1mdata.aws_iam_policy_document.ci_deploy: Reading...[0m[0m
+[0m[1mdata.external.task_ip: Reading...[0m[0m
+[0m[1mdata.aws_iam_policy_document.ci_deploy: Read complete after 0s [id=2501062604][0m
+[0m[1maws_iam_role_policy.ci_deploy: Refreshing state... [id=coin-mlops-ci-deploy:coin-mlops-ci-deploy][0m
+[0m[1mdata.external.task_ip: Read complete after 3s [id=-][0m
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  [31m-[0m destroy[0m
+
+Terraform will perform the following actions:
+
+[1m  # aws_cloudwatch_log_group.app[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_cloudwatch_log_group" "app" {
+      [31m-[0m[0m arn               = "arn:aws:logs:us-east-1:730335657236:log-group:/ecs/coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m id                = "/ecs/coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m log_group_class   = "STANDARD" [90m-> null[0m[0m
+      [31m-[0m[0m name              = "/ecs/coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m retention_in_days = 1 [90m-> null[0m[0m
+      [31m-[0m[0m skip_destroy      = false [90m-> null[0m[0m
+      [31m-[0m[0m tags              = {
+          [31m-[0m[0m "Name" = "coin-mlops-logs"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all          = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-logs"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+        [90m# (2 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # aws_ecr_lifecycle_policy.app[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_ecr_lifecycle_policy" "app" {
+      [31m-[0m[0m id          = "coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m policy      = jsonencode(
+            {
+              [31m-[0m[0m rules = [
+                  [31m-[0m[0m {
+                      [31m-[0m[0m action       = {
+                          [31m-[0m[0m type = "expire"
+                        }
+                      [31m-[0m[0m description  = "Keep only the most recent image"
+                      [31m-[0m[0m rulePriority = 1
+                      [31m-[0m[0m selection    = {
+                          [31m-[0m[0m countNumber = 1
+                          [31m-[0m[0m countType   = "imageCountMoreThan"
+                          [31m-[0m[0m tagStatus   = "any"
+                        }
+                    },
+                ]
+            }
+        ) [90m-> null[0m[0m
+      [31m-[0m[0m registry_id = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m repository  = "coin-mlops" [90m-> null[0m[0m
+    }
+
+[1m  # aws_ecr_repository.app[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_ecr_repository" "app" {
+      [31m-[0m[0m arn                  = "arn:aws:ecr:us-east-1:730335657236:repository/coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m force_delete         = true [90m-> null[0m[0m
+      [31m-[0m[0m id                   = "coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m image_tag_mutability = "MUTABLE" [90m-> null[0m[0m
+      [31m-[0m[0m name                 = "coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m registry_id          = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m repository_url       = "730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m tags                 = {
+          [31m-[0m[0m "Name" = "coin-mlops-ecr"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all             = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-ecr"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+
+      [31m-[0m[0m encryption_configuration {
+          [31m-[0m[0m encryption_type = "AES256" [90m-> null[0m[0m
+            [90m# (1 unchanged attribute hidden)[0m[0m
+        }
+
+      [31m-[0m[0m image_scanning_configuration {
+          [31m-[0m[0m scan_on_push = false [90m-> null[0m[0m
+        }
+    }
+
+[1m  # aws_ecs_cluster.main[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_ecs_cluster" "main" {
+      [31m-[0m[0m arn      = "arn:aws:ecs:us-east-1:730335657236:cluster/coin-mlops-cluster" [90m-> null[0m[0m
+      [31m-[0m[0m id       = "arn:aws:ecs:us-east-1:730335657236:cluster/coin-mlops-cluster" [90m-> null[0m[0m
+      [31m-[0m[0m name     = "coin-mlops-cluster" [90m-> null[0m[0m
+      [31m-[0m[0m tags     = {
+          [31m-[0m[0m "Name" = "coin-mlops-cluster"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-cluster"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+
+      [31m-[0m[0m setting {
+          [31m-[0m[0m name  = "containerInsights" [90m-> null[0m[0m
+          [31m-[0m[0m value = "disabled" [90m-> null[0m[0m
+        }
+    }
+
+[1m  # aws_ecs_service.app[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_ecs_service" "app" {
+      [31m-[0m[0m availability_zone_rebalancing      = "DISABLED" [90m-> null[0m[0m
+      [31m-[0m[0m cluster                            = "arn:aws:ecs:us-east-1:730335657236:cluster/coin-mlops-cluster" [90m-> null[0m[0m
+      [31m-[0m[0m deployment_maximum_percent         = 100 [90m-> null[0m[0m
+      [31m-[0m[0m deployment_minimum_healthy_percent = 0 [90m-> null[0m[0m
+      [31m-[0m[0m desired_count                      = 1 [90m-> null[0m[0m
+      [31m-[0m[0m enable_ecs_managed_tags            = false [90m-> null[0m[0m
+      [31m-[0m[0m enable_execute_command             = false [90m-> null[0m[0m
+      [31m-[0m[0m health_check_grace_period_seconds  = 0 [90m-> null[0m[0m
+      [31m-[0m[0m iam_role                           = "/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS" [90m-> null[0m[0m
+      [31m-[0m[0m id                                 = "arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc" [90m-> null[0m[0m
+      [31m-[0m[0m launch_type                        = "FARGATE" [90m-> null[0m[0m
+      [31m-[0m[0m name                               = "coin-mlops-svc" [90m-> null[0m[0m
+      [31m-[0m[0m platform_version                   = "LATEST" [90m-> null[0m[0m
+      [31m-[0m[0m propagate_tags                     = "NONE" [90m-> null[0m[0m
+      [31m-[0m[0m scheduling_strategy                = "REPLICA" [90m-> null[0m[0m
+      [31m-[0m[0m tags                               = {
+          [31m-[0m[0m "Name" = "coin-mlops-svc"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all                           = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-svc"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m task_definition                    = "arn:aws:ecs:us-east-1:730335657236:task-definition/coin-mlops:1" [90m-> null[0m[0m
+      [31m-[0m[0m triggers                           = {} [90m-> null[0m[0m
+      [31m-[0m[0m wait_for_steady_state              = false [90m-> null[0m[0m
+
+      [31m-[0m[0m deployment_circuit_breaker {
+          [31m-[0m[0m enable   = false [90m-> null[0m[0m
+          [31m-[0m[0m rollback = false [90m-> null[0m[0m
+        }
+
+      [31m-[0m[0m deployment_controller {
+          [31m-[0m[0m type = "ECS" [90m-> null[0m[0m
+        }
+
+      [31m-[0m[0m network_configuration {
+          [31m-[0m[0m assign_public_ip = true [90m-> null[0m[0m
+          [31m-[0m[0m security_groups  = [
+              [31m-[0m[0m "sg-037fc39ccb08f5430",
+            ] [90m-> null[0m[0m
+          [31m-[0m[0m subnets          = [
+              [31m-[0m[0m "subnet-00c42e19067d20931",
+              [31m-[0m[0m "subnet-0c3e2d7344fd48307",
+            ] [90m-> null[0m[0m
+        }
+    }
+
+[1m  # aws_ecs_task_definition.app[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_ecs_task_definition" "app" {
+      [31m-[0m[0m arn                      = "arn:aws:ecs:us-east-1:730335657236:task-definition/coin-mlops:1" [90m-> null[0m[0m
+      [31m-[0m[0m arn_without_revision     = "arn:aws:ecs:us-east-1:730335657236:task-definition/coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m container_definitions    = jsonencode(
+            [
+              [31m-[0m[0m {
+                  [31m-[0m[0m environment      = [
+                      [31m-[0m[0m {
+                          [31m-[0m[0m name  = "BAKED_MODEL_DIR"
+                          [31m-[0m[0m value = "/srv/model"
+                        },
+                      [31m-[0m[0m {
+                          [31m-[0m[0m name  = "MODEL_SOURCE"
+                          [31m-[0m[0m value = "local"
+                        },
+                    ]
+                  [31m-[0m[0m essential        = true
+                  [31m-[0m[0m image            = "730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops:cloud"
+                  [31m-[0m[0m logConfiguration = {
+                      [31m-[0m[0m logDriver = "awslogs"
+                      [31m-[0m[0m options   = {
+                          [31m-[0m[0m awslogs-group         = "/ecs/coin-mlops"
+                          [31m-[0m[0m awslogs-region        = "us-east-1"
+                          [31m-[0m[0m awslogs-stream-prefix = "ecs"
+                        }
+                    }
+                  [31m-[0m[0m mountPoints      = []
+                  [31m-[0m[0m name             = "coin-mlops"
+                  [31m-[0m[0m portMappings     = [
+                      [31m-[0m[0m {
+                          [31m-[0m[0m containerPort = 8000
+                          [31m-[0m[0m hostPort      = 8000
+                          [31m-[0m[0m protocol      = "tcp"
+                        },
+                    ]
+                  [31m-[0m[0m systemControls   = []
+                  [31m-[0m[0m volumesFrom      = []
+                },
+            ]
+        ) [90m-> null[0m[0m
+      [31m-[0m[0m cpu                      = "512" [90m-> null[0m[0m
+      [31m-[0m[0m enable_fault_injection   = false [90m-> null[0m[0m
+      [31m-[0m[0m execution_role_arn       = "arn:aws:iam::730335657236:role/coin-mlops-task-execution" [90m-> null[0m[0m
+      [31m-[0m[0m family                   = "coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m id                       = "coin-mlops" [90m-> null[0m[0m
+      [31m-[0m[0m memory                   = "1024" [90m-> null[0m[0m
+      [31m-[0m[0m network_mode             = "awsvpc" [90m-> null[0m[0m
+      [31m-[0m[0m requires_compatibilities = [
+          [31m-[0m[0m "FARGATE",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m revision                 = 1 [90m-> null[0m[0m
+      [31m-[0m[0m skip_destroy             = false [90m-> null[0m[0m
+      [31m-[0m[0m tags                     = {
+          [31m-[0m[0m "Name" = "coin-mlops-taskdef"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all                 = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-taskdef"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m track_latest             = false [90m-> null[0m[0m
+        [90m# (3 unchanged attributes hidden)[0m[0m
+
+      [31m-[0m[0m runtime_platform {
+          [31m-[0m[0m cpu_architecture        = "X86_64" [90m-> null[0m[0m
+          [31m-[0m[0m operating_system_family = "LINUX" [90m-> null[0m[0m
+        }
+    }
+
+[1m  # aws_iam_openid_connect_provider.github[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_iam_openid_connect_provider" "github" {
+      [31m-[0m[0m arn             = "arn:aws:iam::730335657236:oidc-provider/token.actions.githubusercontent.com" [90m-> null[0m[0m
+      [31m-[0m[0m client_id_list  = [
+          [31m-[0m[0m "sts.amazonaws.com",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m id              = "arn:aws:iam::730335657236:oidc-provider/token.actions.githubusercontent.com" [90m-> null[0m[0m
+      [31m-[0m[0m tags            = {
+          [31m-[0m[0m "Name" = "coin-mlops-github-oidc"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all        = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-github-oidc"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m thumbprint_list = [
+          [31m-[0m[0m "6938fd4d98bab03faadb97b34396831e3780aea1",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m url             = "token.actions.githubusercontent.com" [90m-> null[0m[0m
+    }
+
+[1m  # aws_iam_role.ci_deploy[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_iam_role" "ci_deploy" {
+      [31m-[0m[0m arn                   = "arn:aws:iam::730335657236:role/coin-mlops-ci-deploy" [90m-> null[0m[0m
+      [31m-[0m[0m assume_role_policy    = jsonencode(
+            {
+              [31m-[0m[0m Statement = [
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action    = "sts:AssumeRoleWithWebIdentity"
+                      [31m-[0m[0m Condition = {
+                          [31m-[0m[0m StringEquals = {
+                              [31m-[0m[0m "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+                            }
+                          [31m-[0m[0m StringLike   = {
+                              [31m-[0m[0m "token.actions.githubusercontent.com:sub" = "repo:Davids3498/Coins:*"
+                            }
+                        }
+                      [31m-[0m[0m Effect    = "Allow"
+                      [31m-[0m[0m Principal = {
+                          [31m-[0m[0m Federated = "arn:aws:iam::730335657236:oidc-provider/token.actions.githubusercontent.com"
+                        }
+                    },
+                ]
+              [31m-[0m[0m Version   = "2012-10-17"
+            }
+        ) [90m-> null[0m[0m
+      [31m-[0m[0m create_date           = "2026-08-31T14:01:20Z" [90m-> null[0m[0m
+      [31m-[0m[0m force_detach_policies = false [90m-> null[0m[0m
+      [31m-[0m[0m id                    = "coin-mlops-ci-deploy" [90m-> null[0m[0m
+      [31m-[0m[0m managed_policy_arns   = [] [90m-> null[0m[0m
+      [31m-[0m[0m max_session_duration  = 3600 [90m-> null[0m[0m
+      [31m-[0m[0m name                  = "coin-mlops-ci-deploy" [90m-> null[0m[0m
+      [31m-[0m[0m path                  = "/" [90m-> null[0m[0m
+      [31m-[0m[0m tags                  = {
+          [31m-[0m[0m "Name" = "coin-mlops-ci-deploy"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all              = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-ci-deploy"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m unique_id             = "AROA2UC3FXUKJOYFRFIR3" [90m-> null[0m[0m
+        [90m# (3 unchanged attributes hidden)[0m[0m
+
+      [31m-[0m[0m inline_policy {
+          [31m-[0m[0m name   = "coin-mlops-ci-deploy" [90m-> null[0m[0m
+          [31m-[0m[0m policy = jsonencode(
+                {
+                  [31m-[0m[0m Statement = [
+                      [31m-[0m[0m {
+                          [31m-[0m[0m Action   = "ecr:GetAuthorizationToken"
+                          [31m-[0m[0m Effect   = "Allow"
+                          [31m-[0m[0m Resource = "*"
+                          [31m-[0m[0m Sid      = "EcrAuth"
+                        },
+                      [31m-[0m[0m {
+                          [31m-[0m[0m Action   = [
+                              [31m-[0m[0m "ecr:UploadLayerPart",
+                              [31m-[0m[0m "ecr:PutImage",
+                              [31m-[0m[0m "ecr:InitiateLayerUpload",
+                              [31m-[0m[0m "ecr:GetDownloadUrlForLayer",
+                              [31m-[0m[0m "ecr:CompleteLayerUpload",
+                              [31m-[0m[0m "ecr:BatchGetImage",
+                              [31m-[0m[0m "ecr:BatchCheckLayerAvailability",
+                            ]
+                          [31m-[0m[0m Effect   = "Allow"
+                          [31m-[0m[0m Resource = "arn:aws:ecr:us-east-1:730335657236:repository/coin-mlops"
+                          [31m-[0m[0m Sid      = "EcrPush"
+                        },
+                      [31m-[0m[0m {
+                          [31m-[0m[0m Action   = "ecs:UpdateService"
+                          [31m-[0m[0m Effect   = "Allow"
+                          [31m-[0m[0m Resource = "arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc"
+                          [31m-[0m[0m Sid      = "EcsDeploy"
+                        },
+                      [31m-[0m[0m {
+                          [31m-[0m[0m Action   = [
+                              [31m-[0m[0m "ecs:ListTasks",
+                              [31m-[0m[0m "ecs:DescribeTasks",
+                              [31m-[0m[0m "ecs:DescribeTaskDefinition",
+                              [31m-[0m[0m "ecs:DescribeServices",
+                            ]
+                          [31m-[0m[0m Effect   = "Allow"
+                          [31m-[0m[0m Resource = "*"
+                          [31m-[0m[0m Sid      = "EcsRead"
+                        },
+                      [31m-[0m[0m {
+                          [31m-[0m[0m Action   = [
+                              [31m-[0m[0m "s3:ListBucket",
+                              [31m-[0m[0m "s3:GetObject",
+                            ]
+                          [31m-[0m[0m Effect   = "Allow"
+                          [31m-[0m[0m Resource = [
+                              [31m-[0m[0m "arn:aws:s3:::davids-mlops-artifacts-8412/*",
+                              [31m-[0m[0m "arn:aws:s3:::davids-mlops-artifacts-8412",
+                            ]
+                          [31m-[0m[0m Sid      = "MlflowArtifactRead"
+                        },
+                    ]
+                  [31m-[0m[0m Version   = "2012-10-17"
+                }
+            ) [90m-> null[0m[0m
+        }
+    }
+
+[1m  # aws_iam_role.task_execution[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_iam_role" "task_execution" {
+      [31m-[0m[0m arn                   = "arn:aws:iam::730335657236:role/coin-mlops-task-execution" [90m-> null[0m[0m
+      [31m-[0m[0m assume_role_policy    = jsonencode(
+            {
+              [31m-[0m[0m Statement = [
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action    = "sts:AssumeRole"
+                      [31m-[0m[0m Effect    = "Allow"
+                      [31m-[0m[0m Principal = {
+                          [31m-[0m[0m Service = "ecs-tasks.amazonaws.com"
+                        }
+                    },
+                ]
+              [31m-[0m[0m Version   = "2012-10-17"
+            }
+        ) [90m-> null[0m[0m
+      [31m-[0m[0m create_date           = "2026-08-31T14:01:19Z" [90m-> null[0m[0m
+      [31m-[0m[0m force_detach_policies = false [90m-> null[0m[0m
+      [31m-[0m[0m id                    = "coin-mlops-task-execution" [90m-> null[0m[0m
+      [31m-[0m[0m managed_policy_arns   = [
+          [31m-[0m[0m "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m max_session_duration  = 3600 [90m-> null[0m[0m
+      [31m-[0m[0m name                  = "coin-mlops-task-execution" [90m-> null[0m[0m
+      [31m-[0m[0m path                  = "/" [90m-> null[0m[0m
+      [31m-[0m[0m tags                  = {
+          [31m-[0m[0m "Name" = "coin-mlops-task-execution"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all              = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-task-execution"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m unique_id             = "AROA2UC3FXUKAUVTKPOJS" [90m-> null[0m[0m
+        [90m# (3 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # aws_iam_role_policy.ci_deploy[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_iam_role_policy" "ci_deploy" {
+      [31m-[0m[0m id          = "coin-mlops-ci-deploy:coin-mlops-ci-deploy" [90m-> null[0m[0m
+      [31m-[0m[0m name        = "coin-mlops-ci-deploy" [90m-> null[0m[0m
+      [31m-[0m[0m policy      = jsonencode(
+            {
+              [31m-[0m[0m Statement = [
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action   = "ecr:GetAuthorizationToken"
+                      [31m-[0m[0m Effect   = "Allow"
+                      [31m-[0m[0m Resource = "*"
+                      [31m-[0m[0m Sid      = "EcrAuth"
+                    },
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action   = [
+                          [31m-[0m[0m "ecr:UploadLayerPart",
+                          [31m-[0m[0m "ecr:PutImage",
+                          [31m-[0m[0m "ecr:InitiateLayerUpload",
+                          [31m-[0m[0m "ecr:GetDownloadUrlForLayer",
+                          [31m-[0m[0m "ecr:CompleteLayerUpload",
+                          [31m-[0m[0m "ecr:BatchGetImage",
+                          [31m-[0m[0m "ecr:BatchCheckLayerAvailability",
+                        ]
+                      [31m-[0m[0m Effect   = "Allow"
+                      [31m-[0m[0m Resource = "arn:aws:ecr:us-east-1:730335657236:repository/coin-mlops"
+                      [31m-[0m[0m Sid      = "EcrPush"
+                    },
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action   = "ecs:UpdateService"
+                      [31m-[0m[0m Effect   = "Allow"
+                      [31m-[0m[0m Resource = "arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc"
+                      [31m-[0m[0m Sid      = "EcsDeploy"
+                    },
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action   = [
+                          [31m-[0m[0m "ecs:ListTasks",
+                          [31m-[0m[0m "ecs:DescribeTasks",
+                          [31m-[0m[0m "ecs:DescribeTaskDefinition",
+                          [31m-[0m[0m "ecs:DescribeServices",
+                        ]
+                      [31m-[0m[0m Effect   = "Allow"
+                      [31m-[0m[0m Resource = "*"
+                      [31m-[0m[0m Sid      = "EcsRead"
+                    },
+                  [31m-[0m[0m {
+                      [31m-[0m[0m Action   = [
+                          [31m-[0m[0m "s3:ListBucket",
+                          [31m-[0m[0m "s3:GetObject",
+                        ]
+                      [31m-[0m[0m Effect   = "Allow"
+                      [31m-[0m[0m Resource = [
+                          [31m-[0m[0m "arn:aws:s3:::davids-mlops-artifacts-8412/*",
+                          [31m-[0m[0m "arn:aws:s3:::davids-mlops-artifacts-8412",
+                        ]
+                      [31m-[0m[0m Sid      = "MlflowArtifactRead"
+                    },
+                ]
+              [31m-[0m[0m Version   = "2012-10-17"
+            }
+        ) [90m-> null[0m[0m
+      [31m-[0m[0m role        = "coin-mlops-ci-deploy" [90m-> null[0m[0m
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+
+[1m  # aws_iam_role_policy_attachment.task_execution[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_iam_role_policy_attachment" "task_execution" {
+      [31m-[0m[0m id         = "coin-mlops-task-execution-20260831140119134200000001" [90m-> null[0m[0m
+      [31m-[0m[0m policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" [90m-> null[0m[0m
+      [31m-[0m[0m role       = "coin-mlops-task-execution" [90m-> null[0m[0m
+    }
+
+[1m  # aws_internet_gateway.main[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_internet_gateway" "main" {
+      [31m-[0m[0m arn      = "arn:aws:ec2:us-east-1:730335657236:internet-gateway/igw-048bf8ac4fdedc862" [90m-> null[0m[0m
+      [31m-[0m[0m id       = "igw-048bf8ac4fdedc862" [90m-> null[0m[0m
+      [31m-[0m[0m owner_id = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m tags     = {
+          [31m-[0m[0m "Name" = "coin-mlops-igw"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-igw"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m vpc_id   = "vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+    }
+
+[1m  # aws_route_table.public[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_route_table" "public" {
+      [31m-[0m[0m arn              = "arn:aws:ec2:us-east-1:730335657236:route-table/rtb-0b156c6412643ded6" [90m-> null[0m[0m
+      [31m-[0m[0m id               = "rtb-0b156c6412643ded6" [90m-> null[0m[0m
+      [31m-[0m[0m owner_id         = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m propagating_vgws = [] [90m-> null[0m[0m
+      [31m-[0m[0m route            = [
+          [31m-[0m[0m {
+              [31m-[0m[0m cidr_block                 = "0.0.0.0/0"
+              [31m-[0m[0m gateway_id                 = "igw-048bf8ac4fdedc862"
+                [90m# (11 unchanged attributes hidden)[0m[0m
+            },
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m tags             = {
+          [31m-[0m[0m "Name" = "coin-mlops-public-rt"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all         = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-public-rt"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m vpc_id           = "vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+    }
+
+[1m  # aws_route_table_association.public[0][0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_route_table_association" "public" {
+      [31m-[0m[0m id             = "rtbassoc-0d7009d98801b039f" [90m-> null[0m[0m
+      [31m-[0m[0m route_table_id = "rtb-0b156c6412643ded6" [90m-> null[0m[0m
+      [31m-[0m[0m subnet_id      = "subnet-00c42e19067d20931" [90m-> null[0m[0m
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+
+[1m  # aws_route_table_association.public[1][0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_route_table_association" "public" {
+      [31m-[0m[0m id             = "rtbassoc-0ba00b99f290a98e5" [90m-> null[0m[0m
+      [31m-[0m[0m route_table_id = "rtb-0b156c6412643ded6" [90m-> null[0m[0m
+      [31m-[0m[0m subnet_id      = "subnet-0c3e2d7344fd48307" [90m-> null[0m[0m
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+
+[1m  # aws_security_group.task[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_security_group" "task" {
+      [31m-[0m[0m arn                    = "arn:aws:ec2:us-east-1:730335657236:security-group/sg-037fc39ccb08f5430" [90m-> null[0m[0m
+      [31m-[0m[0m description            = "Inbound 8000 from anywhere; all outbound." [90m-> null[0m[0m
+      [31m-[0m[0m egress                 = [
+          [31m-[0m[0m {
+              [31m-[0m[0m cidr_blocks      = [
+                  [31m-[0m[0m "0.0.0.0/0",
+                ]
+              [31m-[0m[0m description      = "ECR pull, CloudWatch Logs"
+              [31m-[0m[0m from_port        = 0
+              [31m-[0m[0m ipv6_cidr_blocks = []
+              [31m-[0m[0m prefix_list_ids  = []
+              [31m-[0m[0m protocol         = "-1"
+              [31m-[0m[0m security_groups  = []
+              [31m-[0m[0m self             = false
+              [31m-[0m[0m to_port          = 0
+            },
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m id                     = "sg-037fc39ccb08f5430" [90m-> null[0m[0m
+      [31m-[0m[0m ingress                = [
+          [31m-[0m[0m {
+              [31m-[0m[0m cidr_blocks      = [
+                  [31m-[0m[0m "0.0.0.0/0",
+                ]
+              [31m-[0m[0m description      = "FastAPI /health and /predict"
+              [31m-[0m[0m from_port        = 8000
+              [31m-[0m[0m ipv6_cidr_blocks = []
+              [31m-[0m[0m prefix_list_ids  = []
+              [31m-[0m[0m protocol         = "tcp"
+              [31m-[0m[0m security_groups  = []
+              [31m-[0m[0m self             = false
+              [31m-[0m[0m to_port          = 8000
+            },
+        ] [90m-> null[0m[0m
+      [31m-[0m[0m name                   = "coin-mlops-task-sg" [90m-> null[0m[0m
+      [31m-[0m[0m owner_id               = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m revoke_rules_on_delete = false [90m-> null[0m[0m
+      [31m-[0m[0m tags                   = {
+          [31m-[0m[0m "Name" = "coin-mlops-task-sg"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all               = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-task-sg"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m vpc_id                 = "vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+        [90m# (1 unchanged attribute hidden)[0m[0m
+    }
+
+[1m  # aws_subnet.public[0][0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_subnet" "public" {
+      [31m-[0m[0m arn                                            = "arn:aws:ec2:us-east-1:730335657236:subnet/subnet-00c42e19067d20931" [90m-> null[0m[0m
+      [31m-[0m[0m assign_ipv6_address_on_creation                = false [90m-> null[0m[0m
+      [31m-[0m[0m availability_zone                              = "us-east-1a" [90m-> null[0m[0m
+      [31m-[0m[0m availability_zone_id                           = "use1-az1" [90m-> null[0m[0m
+      [31m-[0m[0m cidr_block                                     = "10.20.1.0/24" [90m-> null[0m[0m
+      [31m-[0m[0m enable_dns64                                   = false [90m-> null[0m[0m
+      [31m-[0m[0m enable_lni_at_device_index                     = 0 [90m-> null[0m[0m
+      [31m-[0m[0m enable_resource_name_dns_a_record_on_launch    = false [90m-> null[0m[0m
+      [31m-[0m[0m enable_resource_name_dns_aaaa_record_on_launch = false [90m-> null[0m[0m
+      [31m-[0m[0m id                                             = "subnet-00c42e19067d20931" [90m-> null[0m[0m
+      [31m-[0m[0m ipv6_native                                    = false [90m-> null[0m[0m
+      [31m-[0m[0m map_customer_owned_ip_on_launch                = false [90m-> null[0m[0m
+      [31m-[0m[0m map_public_ip_on_launch                        = true [90m-> null[0m[0m
+      [31m-[0m[0m owner_id                                       = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m private_dns_hostname_type_on_launch            = "ip-name" [90m-> null[0m[0m
+      [31m-[0m[0m tags                                           = {
+          [31m-[0m[0m "Name" = "coin-mlops-public-us-east-1a"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all                                       = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-public-us-east-1a"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m vpc_id                                         = "vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+        [90m# (4 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # aws_subnet.public[1][0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_subnet" "public" {
+      [31m-[0m[0m arn                                            = "arn:aws:ec2:us-east-1:730335657236:subnet/subnet-0c3e2d7344fd48307" [90m-> null[0m[0m
+      [31m-[0m[0m assign_ipv6_address_on_creation                = false [90m-> null[0m[0m
+      [31m-[0m[0m availability_zone                              = "us-east-1b" [90m-> null[0m[0m
+      [31m-[0m[0m availability_zone_id                           = "use1-az2" [90m-> null[0m[0m
+      [31m-[0m[0m cidr_block                                     = "10.20.2.0/24" [90m-> null[0m[0m
+      [31m-[0m[0m enable_dns64                                   = false [90m-> null[0m[0m
+      [31m-[0m[0m enable_lni_at_device_index                     = 0 [90m-> null[0m[0m
+      [31m-[0m[0m enable_resource_name_dns_a_record_on_launch    = false [90m-> null[0m[0m
+      [31m-[0m[0m enable_resource_name_dns_aaaa_record_on_launch = false [90m-> null[0m[0m
+      [31m-[0m[0m id                                             = "subnet-0c3e2d7344fd48307" [90m-> null[0m[0m
+      [31m-[0m[0m ipv6_native                                    = false [90m-> null[0m[0m
+      [31m-[0m[0m map_customer_owned_ip_on_launch                = false [90m-> null[0m[0m
+      [31m-[0m[0m map_public_ip_on_launch                        = true [90m-> null[0m[0m
+      [31m-[0m[0m owner_id                                       = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m private_dns_hostname_type_on_launch            = "ip-name" [90m-> null[0m[0m
+      [31m-[0m[0m tags                                           = {
+          [31m-[0m[0m "Name" = "coin-mlops-public-us-east-1b"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all                                       = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-public-us-east-1b"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m vpc_id                                         = "vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+        [90m# (4 unchanged attributes hidden)[0m[0m
+    }
+
+[1m  # aws_vpc.main[0m will be [1m[31mdestroyed[0m
+[0m  [31m-[0m[0m resource "aws_vpc" "main" {
+      [31m-[0m[0m arn                                  = "arn:aws:ec2:us-east-1:730335657236:vpc/vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+      [31m-[0m[0m assign_generated_ipv6_cidr_block     = false [90m-> null[0m[0m
+      [31m-[0m[0m cidr_block                           = "10.20.0.0/16" [90m-> null[0m[0m
+      [31m-[0m[0m default_network_acl_id               = "acl-0fef75a70578f7b4a" [90m-> null[0m[0m
+      [31m-[0m[0m default_route_table_id               = "rtb-0c387d3839cf6a377" [90m-> null[0m[0m
+      [31m-[0m[0m default_security_group_id            = "sg-0d9c8ea72faa13d12" [90m-> null[0m[0m
+      [31m-[0m[0m dhcp_options_id                      = "dopt-0890c12bcd6c32dba" [90m-> null[0m[0m
+      [31m-[0m[0m enable_dns_hostnames                 = true [90m-> null[0m[0m
+      [31m-[0m[0m enable_dns_support                   = true [90m-> null[0m[0m
+      [31m-[0m[0m enable_network_address_usage_metrics = false [90m-> null[0m[0m
+      [31m-[0m[0m id                                   = "vpc-03ec0a6cdc3a4fc62" [90m-> null[0m[0m
+      [31m-[0m[0m instance_tenancy                     = "default" [90m-> null[0m[0m
+      [31m-[0m[0m ipv6_netmask_length                  = 0 [90m-> null[0m[0m
+      [31m-[0m[0m main_route_table_id                  = "rtb-0c387d3839cf6a377" [90m-> null[0m[0m
+      [31m-[0m[0m owner_id                             = "730335657236" [90m-> null[0m[0m
+      [31m-[0m[0m tags                                 = {
+          [31m-[0m[0m "Name" = "coin-mlops-vpc"
+        } [90m-> null[0m[0m
+      [31m-[0m[0m tags_all                             = {
+          [31m-[0m[0m "ManagedBy" = "terraform"
+          [31m-[0m[0m "Name"      = "coin-mlops-vpc"
+          [31m-[0m[0m "Project"   = "coin-mlops"
+        } [90m-> null[0m[0m
+        [90m# (4 unchanged attributes hidden)[0m[0m
+    }
+
+[1mPlan:[0m 0 to add, 0 to change, 19 to destroy.
+[0m
+Changes to Outputs:
+  [31m-[0m[0m ci_deploy_role_arn = "arn:aws:iam::730335657236:role/coin-mlops-ci-deploy" [90m-> null[0m[0m
+  [31m-[0m[0m cluster_name       = "coin-mlops-cluster" [90m-> null[0m[0m
+  [31m-[0m[0m ecr_repository_url = "730335657236.dkr.ecr.us-east-1.amazonaws.com/coin-mlops" [90m-> null[0m[0m
+  [31m-[0m[0m log_group          = "/ecs/coin-mlops" [90m-> null[0m[0m
+  [31m-[0m[0m service_name       = "coin-mlops-svc" [90m-> null[0m[0m
+  [31m-[0m[0m service_url        = "http://100.54.47.64:8000" [90m-> null[0m[0m
+  [31m-[0m[0m task_ip_status     = "running" [90m-> null[0m[0m
+  [31m-[0m[0m task_public_ip     = "100.54.47.64" [90m-> null[0m[0m
+[0m[1maws_ecr_lifecycle_policy.app: Destroying... [id=coin-mlops][0m[0m
+[0m[1maws_iam_role_policy.ci_deploy: Destroying... [id=coin-mlops-ci-deploy:coin-mlops-ci-deploy][0m[0m
+[0m[1maws_route_table_association.public[0]: Destroying... [id=rtbassoc-0d7009d98801b039f][0m[0m
+[0m[1maws_route_table_association.public[1]: Destroying... [id=rtbassoc-0ba00b99f290a98e5][0m[0m
+[0m[1maws_iam_role_policy.ci_deploy: Destruction complete after 0s[0m
+[0m[1maws_iam_role.ci_deploy: Destroying... [id=coin-mlops-ci-deploy][0m[0m
+[0m[1maws_ecs_service.app: Destroying... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc][0m[0m
+[0m[1maws_ecr_lifecycle_policy.app: Destruction complete after 0s[0m
+[0m[1maws_iam_role.ci_deploy: Destruction complete after 1s[0m
+[0m[1maws_iam_openid_connect_provider.github: Destroying... [id=arn:aws:iam::730335657236:oidc-provider/token.actions.githubusercontent.com][0m[0m
+[0m[1maws_iam_openid_connect_provider.github: Destruction complete after 0s[0m
+[0m[1maws_route_table_association.public[0]: Still destroying... [id=rtbassoc-0d7009d98801b039f, 10s elapsed][0m[0m
+[0m[1maws_route_table_association.public[1]: Still destroying... [id=rtbassoc-0ba00b99f290a98e5, 10s elapsed][0m[0m
+[0m[1maws_ecs_service.app: Still destroying... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc, 10s elapsed][0m[0m
+[0m[1maws_route_table_association.public[1]: Still destroying... [id=rtbassoc-0ba00b99f290a98e5, 23s elapsed][0m[0m
+[0m[1maws_route_table_association.public[0]: Still destroying... [id=rtbassoc-0d7009d98801b039f, 23s elapsed][0m[0m
+[0m[1maws_ecs_service.app: Still destroying... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc, 24s elapsed][0m[0m
+[0m[1maws_route_table_association.public[0]: Destruction complete after 28s[0m
+[0m[1maws_route_table_association.public[1]: Destruction complete after 28s[0m
+[0m[1maws_route_table.public: Destroying... [id=rtb-0b156c6412643ded6][0m[0m
+[0m[1maws_route_table.public: Destruction complete after 1s[0m
+[0m[1maws_internet_gateway.main: Destroying... [id=igw-048bf8ac4fdedc862][0m[0m
+[0m[1maws_ecs_service.app: Still destroying... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc, 34s elapsed][0m[0m
+[0m[1maws_internet_gateway.main: Destruction complete after 7s[0m
+[0m[1maws_ecs_service.app: Still destroying... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc, 44s elapsed][0m[0m
+[0m[1maws_ecs_service.app: Still destroying... [id=arn:aws:ecs:us-east-1:730335657236:service/coin-mlops-cluster/coin-mlops-svc, 57s elapsed][0m[0m
+[0m[1maws_ecs_service.app: Destruction complete after 57s[0m
+[0m[1maws_iam_role_policy_attachment.task_execution: Destroying... [id=coin-mlops-task-execution-20260831140119134200000001][0m[0m
+[0m[1maws_subnet.public[1]: Destroying... [id=subnet-0c3e2d7344fd48307][0m[0m
+[0m[1maws_subnet.public[0]: Destroying... [id=subnet-00c42e19067d20931][0m[0m
+[0m[1maws_ecs_cluster.main: Destroying... [id=arn:aws:ecs:us-east-1:730335657236:cluster/coin-mlops-cluster][0m[0m
+[0m[1maws_security_group.task: Destroying... [id=sg-037fc39ccb08f5430][0m[0m
+[0m[1maws_ecs_task_definition.app: Destroying... [id=coin-mlops][0m[0m
+[0m[1maws_iam_role_policy_attachment.task_execution: Destruction complete after 1s[0m
+[0m[1maws_ecs_task_definition.app: Destruction complete after 1s[0m
+[0m[1maws_cloudwatch_log_group.app: Destroying... [id=/ecs/coin-mlops][0m[0m
+[0m[1maws_ecr_repository.app: Destroying... [id=coin-mlops][0m[0m
+[0m[1maws_iam_role.task_execution: Destroying... [id=coin-mlops-task-execution][0m[0m
+[0m[1maws_ecs_cluster.main: Destruction complete after 1s[0m
+[0m[1maws_ecr_repository.app: Destruction complete after 0s[0m
+[0m[1maws_iam_role.task_execution: Destruction complete after 0s[0m
+[0m[1maws_cloudwatch_log_group.app: Destruction complete after 0s[0m
+[0m[1maws_subnet.public[0]: Destruction complete after 2s[0m
+[0m[1maws_subnet.public[1]: Destruction complete after 2s[0m
+[0m[1maws_security_group.task: Destruction complete after 2s[0m
+[0m[1maws_vpc.main: Destroying... [id=vpc-03ec0a6cdc3a4fc62][0m[0m
+[0m[1maws_vpc.main: Destruction complete after 1s[0m
+[0m[1m[32m
+Destroy complete! Resources: 19 destroyed.
+[0m
+==============================================================
+Verifying nothing is left
+==============================================================
+
+-- ECS clusters
+  ok - no cluster matching 'coin-mlops'
+
+-- ECS services
+  ok - no cluster, so no services (aws ecs list-services needs one)
+
+-- Running Fargate tasks
+  ok - no running tasks under a 'coin-mlops' cluster
+
+-- VPCs tagged Project=coin-mlops
+  ok - no VPC tagged Project=coin-mlops
+
+-- NAT gateways (should never exist for this project)
+  ok - no NAT gateways
+
+-- Elastic IPs tagged Project=coin-mlops
+  ok - no Elastic IPs
+
+-- ECR repositories
+  ok - no ECR repository matching 'coin-mlops'
+
+-- CloudWatch log groups
+  ok - no log group /ecs/coin-mlops
+
+-- IAM roles
+  ok - no IAM roles prefixed 'coin-mlops'
+
+-- GitHub OIDC provider
+  ok - no GitHub OIDC provider
+
+==============================================================
+CLEAN - nothing tagged Project=coin-mlops remains in us-east-1.
+==============================================================
+
+### 8. Cost ###################################################################
+
+Independent teardown check (not via destroy.sh -- asking AWS directly):
+
+  $ aws ecs list-clusters                                        -> (empty)
+  $ aws ec2 describe-vpcs --query 'Vpcs[?IsDefault==`false`]'    -> (empty)
+  $ aws ecr describe-repositories                                -> (empty)
+  $ aws logs describe-log-groups                                 -> (empty)
+  $ aws iam list-roles | grep coin                               -> (empty)
+  $ aws iam list-open-id-connect-providers                       -> (empty)
+  $ terraform state list                                         -> (empty, serial 49)
+
+Billable window, from the task's own timestamps:
+
+  task startedAt        2026-08-31T14:02:43Z
+  destroy completed     2026-08-31T14:33:21Z
+  ------------------------------------------
+  Fargate task lifetime 30.6 min = 0.510 h
+
+  Fargate vCPU   0.5 x $0.04048/h x 0.510 h  = $0.0103
+  Fargate memory 1.0 x $0.004445/h x 0.510 h = $0.0023
+  Public IPv4    1   x $0.005/h    x 0.510 h = $0.0026
+  ECR storage    ~0.65 GB x $0.10/GB-mo x 0.55 h, under the 500 MB free tier
+                                             = $0.0000
+  CloudWatch     a few KB ingested, 1-day retention
+                                             = $0.0000
+  ------------------------------------------------------
+  TOTAL                                        ~$0.015
+
+Cost Explorer for 2026-08-31 still reports $0 with Estimated=true: CE lags
+usage by up to 24 hours and the stack was destroyed ~1 h before this query.
+The figure above is derived from the metered timestamps and published us-east-1
+rates, not read back from a settled bill. Budget was $10; this used ~0.15% of it.
+
+  $ aws ce get-cost-and-usage --time-period Start=2026-08-31,End=2026-09-01 \
+      --granularity DAILY --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE
+  {"Total": {"UnblendedCost": {"Amount": "0", "Unit": "USD"}}, "Groups": [],
+   "Estimated": true}
+
+### Summary ###################################################################
+
+  provisioned  19 resources, no NAT gateway, no load balancer, local state
+  verified     /health reported champion v10 (model_source=local), same version
+               as local; /predict returned NERO with the same top-3 ordering and
+               probabilities matching local to 7 significant figures
+  destroyed    19/19, verified clean by destroy.sh (exit 0) and independently
