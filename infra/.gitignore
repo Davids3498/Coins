@@ -1,0 +1,16 @@
+# Local state. It records every resource ID in the stack and, for some providers, secrets in
+# plaintext -- it is not committable, and this stack's state is worthless after teardown anyway.
+# The production answer is an S3 backend with DynamoDB locking; see versions.tf for why that is
+# deliberately not set up here.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# Saved plan files. Binary, machine- and moment-specific, and they embed resolved values from
+# state -- a committed plan is stale the instant anything changes and is not reviewable anyway.
+tfplan
+*.tfplan
+*.tfvars
+!example.tfvars

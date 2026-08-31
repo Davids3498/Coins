@@ -1,9 +1,24 @@
 """FastAPI server for the distilled coin classifier.
 
-Model source: the current @champion in the MLflow registry
-(models:/coin-classifier@champion), loaded on startup via a FastAPI lifespan -- no baked-in
-checkpoint. Because the full model was logged (not just weights), no architecture-rebuild code
-is needed here; mlflow.pytorch.load_model reconstructs the nn.Module directly.
+Model source is selected by MODEL_SOURCE, and it is the ONLY thing that differs between the
+local/dev deployment and the cloud one:
+
+    registry (default)  Resolve models:/coin-classifier@champion against the tracking server at
+                        MLFLOW_TRACKING_URI. The alias is the source of truth, so a promotion
+                        changes what a restart serves without rebuilding anything.
+    local               Load a champion already exported into the image at BAKED_MODEL_DIR.
+                        For deployments with no reachable tracking server (Fargate) -- the
+                        image is self-contained and needs no network to start.
+
+Both paths return the same (nn.Module, version) pair, so nothing downstream -- endpoints,
+prediction log, /health -- knows which one ran. Because the full model was logged (not just
+weights), no architecture-rebuild code is needed on either path; mlflow.pytorch.load_model
+reconstructs the nn.Module from a registry URI and from a local directory alike.
+
+The `local` path is NOT a shortcut around the registry: the export records the registry version
+it came from (scripts/export_champion.py writes champion.json next to the artifact) and /health
+reports it, so a baked image can still answer "which champion is this?" with the same number the
+registry would give. An image that cannot answer that is an untraceable binary.
 
 The load happens in `lifespan` (startup), NOT at import, and the endpoints receive the loaded
 model via the `get_bundle` dependency. That keeps the module importable with no registry call,
@@ -22,6 +37,7 @@ Endpoints:
     POST /predict  multipart image upload -> top-k predictions (incl. model_version)
 """
 import io
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -49,6 +65,13 @@ MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:50
 MODEL_NAME = os.environ.get("MODEL_NAME", "coin-classifier")
 MODEL_ALIAS = os.environ.get("MODEL_ALIAS", "champion")
 
+# "registry" by default so the existing local/dev deployment is unchanged by this flag existing.
+# serve-cloud.Dockerfile is the only thing that sets "local", and it sets it in the image.
+MODEL_SOURCE = os.environ.get("MODEL_SOURCE", "registry")
+# Where serve-cloud.Dockerfile puts the export: champion.json (provenance) + artifact/ (the
+# MLflow model directory). Only read when MODEL_SOURCE=local.
+BAKED_MODEL_DIR = Path(os.environ.get("BAKED_MODEL_DIR", APP_DIR.parent / "model"))
+
 # Default resolves to <repo>/outputs/monitoring/predictions.db on the host and
 # /srv/outputs/monitoring/predictions.db in the container. The container path MUST be a mounted
 # volume (`make serve` mounts it) or the log dies with `docker run --rm` and the host-side drift
@@ -66,6 +89,9 @@ class ModelBundle:
     model: nn.Module
     version: str
     idx_to_name: dict
+    # Which load path produced this bundle. Defaulted so a caller that only cares about the
+    # model (every test) constructs a bundle exactly as before.
+    source: str = "registry"
 
 
 def load_model_from_registry(
@@ -78,11 +104,54 @@ def load_model_from_registry(
     return model, version
 
 
+def load_model_from_baked(model_dir: Path, device: torch.device) -> tuple[nn.Module, str]:
+    """Load a champion exported into the image by scripts/export_champion.py.
+
+    Touches no network: an MLflow model directory is self-describing, so load_model on a local
+    path never contacts the tracking server. The version is NOT inferred from the artifact --
+    it is read from the champion.json the export wrote, which is the only record of which
+    registry version this binary actually is. A missing or malformed sidecar is fatal: serving
+    a model that cannot name itself is worse than not starting.
+    """
+    meta_path = model_dir / "champion.json"
+    if not meta_path.is_file():
+        raise RuntimeError(
+            f"MODEL_SOURCE=local but no export found at {meta_path}. "
+            "Build the cloud image with serve-cloud.Dockerfile (see scripts/export_champion.py)."
+        )
+    meta = json.loads(meta_path.read_text())
+    try:
+        version = str(meta["version"])
+    except KeyError:
+        raise RuntimeError(f"{meta_path} records no 'version' -- cannot say what this image serves")
+
+    artifact_dir = model_dir / "artifact"
+    if not artifact_dir.is_dir():
+        raise RuntimeError(f"MODEL_SOURCE=local but no model artifact at {artifact_dir}")
+
+    model = mlflow.pytorch.load_model(str(artifact_dir))
+    model.to(device).eval()
+    return model, version
+
+
 def build_bundle() -> ModelBundle:
-    """The real, resource-touching load. Called from lifespan; overridden in tests."""
+    """The real, resource-touching load. Called from lifespan; overridden in tests.
+
+    The MODEL_SOURCE branch lives here rather than at import so the module still imports with no
+    network and no export present -- the property the --network none CI smoke test enforces.
+    """
     idx_to_name = load_labels(LABELS_PATH)
-    model, version = load_model_from_registry(MLFLOW_TRACKING_URI, MODEL_NAME, MODEL_ALIAS, DEVICE)
-    return ModelBundle(model=model, version=version, idx_to_name=idx_to_name)
+    if MODEL_SOURCE == "registry":
+        model, version = load_model_from_registry(
+            MLFLOW_TRACKING_URI, MODEL_NAME, MODEL_ALIAS, DEVICE
+        )
+    elif MODEL_SOURCE == "local":
+        model, version = load_model_from_baked(BAKED_MODEL_DIR, DEVICE)
+    else:
+        raise RuntimeError(f"MODEL_SOURCE must be 'registry' or 'local', got {MODEL_SOURCE!r}")
+    return ModelBundle(
+        model=model, version=version, idx_to_name=idx_to_name, source=MODEL_SOURCE
+    )
 
 
 @asynccontextmanager
@@ -157,6 +226,9 @@ class HealthResponse(BaseModel):
     num_classes: int
     model_name: str
     model_version: str
+    # "registry" or "local" -- how model_version was obtained. Additive: model_version means the
+    # same registry version either way, this only says whether it was resolved live or baked in.
+    model_source: str
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -167,6 +239,7 @@ def health(bundle: ModelBundle = Depends(get_bundle)) -> HealthResponse:
         num_classes=len(bundle.idx_to_name),
         model_name=MODEL_NAME,
         model_version=bundle.version,
+        model_source=bundle.source,
     )
 
 

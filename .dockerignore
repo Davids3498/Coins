@@ -16,6 +16,11 @@
 !pyproject.toml
 !requirements-serve.txt
 
+# serve-cloud.Dockerfile only. Gitignored (24 MB of weights) and absent until
+# scripts/export_champion.py has run -- serve.Dockerfile COPYs nothing from it, so a missing
+# export costs the base build nothing and fails the cloud build loudly, which is correct.
+!build/champion
+
 # Re-excluded AFTER the allowlist (last match wins) -- these live inside app/ and src/ and are
 # rebuilt in the image anyway.
 **/__pycache__
