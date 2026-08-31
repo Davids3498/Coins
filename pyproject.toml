@@ -20,10 +20,11 @@ dependencies = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-# "." alongside "src" is deliberate. The nine root-level test_*.py modules import root modules
-# (promote, splits, drift_report, monitor_state, replay_traffic, app.main) and are NOT moved into
-# tests/ -- moving them would break those imports. Pinning both entries here makes that work by
-# configuration rather than by pytest's incidental rootdir insertion.
+# "." alongside "src" is deliberate, and it is what lets every test live under tests/. The suite
+# imports two layers: the installed package (src) and the root-level scripts the pipeline is made
+# of (promote, splits, drift_report, monitor_state, replay_traffic, app.main). Once no test file
+# sits at the repo root, pytest no longer inserts the root into sys.path on its own -- so this
+# entry is load-bearing, not a convenience. Dropping it breaks six test modules at import time.
 pythonpath = ["src", "."]
 
 # Collection is pinned, not discovered. data/ is 51 GB, .dvc/ is a 44 GB cache and weights/ is

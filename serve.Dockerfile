@@ -1,10 +1,22 @@
-# Serves emp_model_distil_student.pth (MobileNetV3-Large, distilled coin classifier)
-# behind a FastAPI app with /predict and /health.
+# Serves whatever the MLflow registry currently aliases @champion
+# (models:/coin-classifier@champion) behind a FastAPI app with /predict and /health.
 #
-# CPU-only image by default (the student model is 5.4M params — CPU inference is
-# fast enough for single-image requests and this keeps the image small/portable).
-# For GPU inference, switch the base image to an nvidia/cuda runtime image and
-# install torch from https://download.pytorch.org/whl/cu121 instead.
+# NO CHECKPOINT IS BAKED IN. Nothing under weights/ is COPYed here on purpose: the model
+# is resolved by alias at startup, inside app/main.py's lifespan, so a promotion changes
+# what this image serves without rebuilding it. Two consequences worth knowing before you
+# run it:
+#   * The container needs a reachable tracking server AND its artifact store at RUNTIME --
+#     the alias lookup and the weights download both happen on startup. `make serve` wires
+#     both (host network + ~/.aws mounted read-only); a bare `docker run` on the default
+#     bridge network cannot reach a tracking server on the host's 127.0.0.1 and will fail
+#     to start.
+#   * The alias is resolved ONCE. After a promotion this container keeps serving -- and
+#     logging -- the previous version until it is restarted.
+#
+# CPU-only image by default: the model is MobileNetV3-Large, 4.27M params with the
+# 51-class head, so single-image inference is fast enough without a GPU and the image
+# stays small/portable. For GPU inference, switch the base image to an nvidia/cuda runtime
+# image and install torch from https://download.pytorch.org/whl/cu121 instead.
 
 FROM python:3.10-slim
 
