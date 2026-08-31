@@ -230,7 +230,7 @@ def test_unassessed_decision_leaves_the_cursor_alone():
 
 # --- the epochs guarantee -------------------------------------------------------------------------------
 
-DAG_PATH = Path(__file__).resolve().parent / "dags" / "retrain_coin_clf.py"
+DAG_PATH = Path(__file__).resolve().parents[1] / "dags" / "retrain_coin_clf.py"
 
 
 def render_train_flag(flag, conf, params):
