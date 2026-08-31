@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import inspect
 import json
 import sys
@@ -54,16 +55,7 @@ from coin_clf.image_meta import decodes  # noqa: E402
 # have the 51 GB dataset -- which is the only way any of it runs in CI. Absent the flags the
 # numbers below are exactly what they always were, so a bare run is unchanged.
 #
-# The batch size the DAG is pinned to; the cursor counts batch NUMBERS, so released-count
-# arithmetic is only meaningful against the same size that produced the cursor.
-#
-# This MUST equal dags/retrain_coin_clf.py's BATCH_SIZE. It said 200 while the DAG released 5000,
-# and with the cursor at 2 that credited 400 released images instead of 10,000 -- reported as
-# 9,600 phantom TRAIN x FUTURE-POOL hash collisions, a 9,600-image gap in the A4 reconciliation,
-# and a 9,600-file symmetric difference on active_train.txt. Three red checks, all measuring the
-# checker's own stale constant rather than anything about the data. Corrected to 5000, against
-# which the real tree reconciles exactly.
-DAG_BATCH_SIZE = 5000
+RETRAIN_DAG = REPO_ROOT / "dags" / "retrain_coin_clf.py"
 CLEAN_CORPUS_EXPECTED = 57792   # what the reconciliation in A4 must land on
 ORIGINALS_EXPECTED = 62134      # clean survivors + quarantined, before any file was condemned
 CLASSES_EXPECTED = 51           # label space after the GORDIAN II -> GORDIAN I merge
@@ -97,6 +89,42 @@ class Report:
     @property
     def failures(self) -> list[tuple[str, bool, str]]:
         return [r for r in self.rows if not r[1]]
+
+
+def dag_batch_size() -> int:
+    """The future-pool batch size, read from the DAG that actually releases the batches.
+
+    ONE SOURCE OF TRUTH, on purpose. This used to be a second copy of the number, declared here
+    as 200 while dags/retrain_coin_clf.py released 5000. The cursor counts batch NUMBERS, so with
+    the cursor at 2 the report credited 400 released images instead of 10,000 and then blamed the
+    data: 9,600 phantom TRAIN x FUTURE-POOL hash collisions, a 9,600-image gap in the A4
+    reconciliation, and a 9,600-file symmetric difference on active_train.txt. Three red checks,
+    none of them about the dataset.
+
+    Correcting the copy would have fixed that run and left the mechanism intact. Two constants
+    that must agree, in files nobody edits together, is the same shape as the train/serve
+    transforms and the rival holdout definitions -- both of which diverged silently, and both of
+    which cost a re-run of everything downstream. So there is no local copy to correct any more.
+
+    Read by AST rather than imported: retrain_coin_clf.py imports airflow, which is deliberately
+    absent from requirements-dev.txt (the scheduler's dependencies have no business in the test
+    environment). Parsing the assignment costs nothing and needs no airflow.
+    """
+    for node in ast.parse(RETRAIN_DAG.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(tgt, ast.Name) and tgt.id == "BATCH_SIZE" for tgt in node.targets
+        ):
+            if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, int):
+                raise RuntimeError(
+                    f"BATCH_SIZE in {RETRAIN_DAG} is no longer a plain int literal; this reader "
+                    f"cannot resolve it. Pass --batch-size explicitly, or keep it a literal."
+                )
+            return node.value.value
+    raise RuntimeError(
+        f"no module-level BATCH_SIZE assignment in {RETRAIN_DAG}. The released-image arithmetic "
+        f"in section A is meaningless without it -- pass --batch-size explicitly if the DAG has "
+        f"genuinely stopped owning this number."
+    )
 
 
 def section(title: str) -> None:
@@ -605,8 +633,6 @@ def section_c(cfg, rep: Report) -> None:
     # AST, not a substring scan: train.py's docstring legitimately EXPLAINS that distillation was
     # removed, and a grep for "teacher" cannot tell prose from a live import. What matters is
     # whether any name the interpreter would actually resolve still reaches the teacher.
-    import ast
-
     tree_ast = ast.parse((REPO_ROOT / "train.py").read_text())
     imported: set[str] = set()
     identifiers: set[str] = set()
@@ -641,8 +667,6 @@ def section_c(cfg, rep: Report) -> None:
 
 
 def _imports_of(path: Path) -> set[str]:
-    import ast
-
     mods: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Import):
@@ -678,8 +702,16 @@ def main() -> None:
     exp.add_argument("--expect-clean-corpus", type=int, default=CLEAN_CORPUS_EXPECTED)
     exp.add_argument("--expect-originals", type=int, default=ORIGINALS_EXPECTED)
     exp.add_argument("--expect-classes", type=int, default=CLASSES_EXPECTED)
-    exp.add_argument("--batch-size", type=int, default=DAG_BATCH_SIZE)
+    exp.add_argument("--batch-size", type=int, default=None,
+                     help="future-pool batch size (default: read from "
+                          "dags/retrain_coin_clf.py's BATCH_SIZE)")
     args = p.parse_args()
+
+    # Explicit flag wins (a fixture tree has its own batch size); otherwise the DAG is the
+    # authority and there is no second copy of the number to fall out of step with it.
+    resolved_batch_size = args.batch_size if args.batch_size is not None else dag_batch_size()
+    batch_size_src = ("--batch-size" if args.batch_size is not None
+                      else f"{RETRAIN_DAG.relative_to(REPO_ROOT)} BATCH_SIZE")
 
     root = Path(args.data_root) if args.data_root else REPO_ROOT / "data"
 
@@ -695,7 +727,7 @@ def main() -> None:
         quarantine_dir = _p(args.quarantine_dir, "quarantine")
         # Only a default run has a repo-root alias to compare against (see B1c).
         repo_alias = None if args.data_root else REPO_ROOT / "FOR_TRAINNING"
-        batch_size = args.batch_size
+        batch_size = resolved_batch_size
         expect_clean_corpus = args.expect_clean_corpus
         expect_originals = args.expect_originals
         expect_classes = args.expect_classes
@@ -724,6 +756,7 @@ def main() -> None:
                         ("manifest", cfg.manifest), ("active_train_list", cfg.active_train_list),
                         ("cursor_file", cfg.cursor_file), ("quarantine_dir", cfg.quarantine_dir)):
         print(f"  {label:<20} {path}  {'OK' if path.exists() else 'MISSING'}")
+    print(f"  {'batch_size':<20} {cfg.batch_size}  (from {batch_size_src})")
     print()
     tree = hash_tree(cfg.data_dir, args.jobs)
 

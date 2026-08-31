@@ -1,8 +1,8 @@
 # verify_data_integrity.py -- full run over the real tree
 # host:    Linux 6.18.33.2-microsoft-standard-WSL2
 # python:  Python 3.10.12
-# commit:  5072ccc (+ staged working tree)
-# date:    2026-08-31T00:34:24+03:00
+# commit:  c8b81bc (+ working tree)
+# date:    2026-08-31T00:53:30+03:00
 # command: PYTHONPATH=src python3 verify_data_integrity.py --jobs 8
 
 
@@ -15,6 +15,7 @@ SECTION 0 -- INPUTS (claims under test) + FRESH HASHING OF THE REAL TREE
   active_train_list    /home/david/coin/data/active_train.txt  OK
   cursor_file          /home/david/coin/data/future_pool_cursor.json  OK
   quarantine_dir       /home/david/coin/data/quarantine  OK
+  batch_size           5000  (from dags/retrain_coin_clf.py BATCH_SIZE)
 
   globbing /home/david/coin/data/FOR_TRAINNING/*/side_a/*.jpg -> 57792 files
   hashing all 57792 files fresh with 8 process(es) (nothing is read from drop_log.csv or any cache)...
@@ -23,7 +24,7 @@ SECTION 0 -- INPUTS (claims under test) + FRESH HASHING OF THE REAL TREE
     tree: 30000/57792
     tree: 40000/57792
     tree: 50000/57792
-  hashed 57792 files in 1.1s
+  hashed 57792 files in 1.0s
 
 ==============================================================================================
 SECTION A -- PARTITION INTEGRITY (by content hash; filenames are never the key)
@@ -81,7 +82,7 @@ SECTION A -- PARTITION INTEGRITY (by content hash; filenames are never the key)
 
 --- A6. every file in the clean corpus actually decodes (not just: exists and hashes) -------
   full-decoding all 57792 files with 8 process(es) (header parsing is not enough -- see coin_clf.image_meta.decodes)...
-  decoded 57792 files in 11.6s -- 0 unreadable
+  decoded 57792 files in 13.1s -- 0 unreadable
   [PASS] A6 every file in the training tree decodes end-to-end -- 0 unreadable file(s)
 
 ==============================================================================================

@@ -45,15 +45,30 @@ markers = [
 ]
 
 [tool.ruff]
-# notebooks/ is an archive of experiment records, not maintained code: 153 of the 169 findings
-# on this tree came from there (semicolons, unused imports in exploratory cells). Linting it
-# would make `ruff check .` permanently red and teach everyone to ignore the gate.
+# notebooks/ is an archive of experiment records -- the runs that produced v1..v7 and the
+# distillation path, kept so a published number can be traced back to the code that produced it.
+# They are history, not maintained code, and 153 of the 169 findings on this tree came from
+# there (semicolons, unused imports in exploratory cells). Linting them would make
+# `ruff check .` permanently red on files nobody may edit, which teaches everyone to ignore the
+# gate -- the one outcome that costs more than the lint debt.
+#
+# This is an exclusion for ARCHIVED work, not for notebooks generally. A notebook that becomes
+# part of the pipeline should move out of notebooks/ and be linted like everything else.
 exclude = ["notebooks"]
 
 [tool.ruff.lint]
-# E741 (`l` as a comprehension variable) is house style here, in the exact files that the three
-# leakage incidents came from -- coin_clf/data.py, verify_data_integrity.py, monitor_state.py.
-# Rewriting 11 sites in that code to satisfy a cosmetic rule is churn where churn is expensive.
+# E741 ("ambiguous variable name `l`") is ignored as a DELIBERATE call, not an oversight.
+#
+# All 11 occurrences are the same idiom -- `[l for l in path.read_text().splitlines() if l.strip()]`
+# -- and they sit in coin_clf/data.py, verify_data_integrity.py, monitor_state.py and splits.py:
+# the exact files that read the clean list, the manifest and the active-train list. That code is
+# where all three leakage incidents originated, so every diff touching it costs a careful review
+# and a re-run of verify_data_integrity.py over 57,792 files. Spending that on renaming a loop
+# variable buys nothing: `l` is ambiguous with `1` in some fonts, which is a readability argument,
+# and these are one-line comprehensions where the binding never leaves the line.
+#
+# What would reverse this: the rule catching a real ambiguity in NEW code. Prefer a descriptive
+# name when writing anything here; this only stops the gate from being red about existing lines.
 ignore = ["E741"]
 
 [tool.mypy]
