@@ -1,0 +1,77 @@
+{
+  "status": "ok",
+  "drift_detected": true,
+  "drifted_signals": [
+    "predicted_class",
+    "confidence",
+    "image_metadata"
+  ],
+  "trigger_reason": "predicted_class:predicted_label (jensenshannon 0.6058 > 0.35); confidence:confidence (wasserstein 0.8124 > 0.25); image_metadata:height (wasserstein 0.8763 > 0.25); image_metadata:mode (jensenshannon 0.8326 > 0.35); image_metadata:width (wasserstein 0.8700 > 0.25)",
+  "signals": {
+    "predicted_class": {
+      "drifted": true,
+      "columns": {
+        "predicted_label": {
+          "score": 0.605769,
+          "method": "jensenshannon",
+          "threshold": 0.35,
+          "drifted": true
+        }
+      }
+    },
+    "confidence": {
+      "drifted": true,
+      "columns": {
+        "confidence": {
+          "score": 0.812409,
+          "method": "wasserstein",
+          "threshold": 0.25,
+          "drifted": true
+        }
+      }
+    },
+    "image_metadata": {
+      "drifted": true,
+      "columns": {
+        "width": {
+          "score": 0.870042,
+          "method": "wasserstein",
+          "threshold": 0.25,
+          "drifted": true
+        },
+        "height": {
+          "score": 0.876259,
+          "method": "wasserstein",
+          "threshold": 0.25,
+          "drifted": true
+        },
+        "mode": {
+          "score": 0.832555,
+          "method": "jensenshannon",
+          "threshold": 0.35,
+          "drifted": true
+        }
+      }
+    }
+  },
+  "sample": {
+    "n_production": 601,
+    "n_reference": 11559,
+    "min_samples": 500,
+    "since": null,
+    "source": "skewed-replay",
+    "model_version": "10",
+    "excluded_other_versions": 0,
+    "model_versions_seen": [
+      "10"
+    ]
+  },
+  "reference": {
+    "split": "holdout",
+    "model_version": "10",
+    "cache_path": "/home/david/coin/outputs/monitoring/reference/reference_v10_holdout.csv",
+    "generated_at": "2026-08-24T21:53:40.056622+00:00"
+  },
+  "report_html": "outputs/monitoring/drift_skewed.html",
+  "generated_at": "2026-08-25T09:32:38.744462+00:00"
+}

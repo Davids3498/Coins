@@ -1,66 +1,154 @@
-# Roman Coin Classifier
+# MLOps platform for an image classifier — retraining, promotion gating, and drift monitoring
 
-Classifies photos of Roman Imperial coins by emperor (51 classes, GORDIAN II
-merged into GORDIAN I). It began as a series of notebooks that iterated on
-feature extraction, head architecture and ensembling; what is in the repo now is
-the pipeline that grew around one small deployable model:
+[![CI](https://github.com/Davids3498/Coins/actions/workflows/ci.yml/badge.svg)](https://github.com/Davids3498/Coins/actions/workflows/ci.yml)
 
-* a dataset carved **once** into train / frozen-holdout / future-pool, with the
-  carve provable from the bytes on disk (`verify_data_integrity.py`),
-* an MLflow registry with a champion/challenger **promotion gate** that re-scores
-  both models on that one holdout before moving `@champion`,
-* a FastAPI server that loads `@champion` from the registry at startup and logs
-  every prediction to SQLite,
-* an Evidently **drift check** over that log, and
-* two Airflow DAGs that close the loop: drift → retrain → evaluate → promote.
+The workload is a Roman-coin classifier: photos of Roman Imperial coins sorted by
+emperor, 51 classes, 57,792 images, a MobileNetV3-Large at **0.9201** holdout
+accuracy. The deliverable is everything around it — a dataset carved once into
+partitions that are *provably* disjoint by content hash, an MLflow registry whose
+`@champion` alias only moves through a gate that re-scores both models, a FastAPI
+server that logs every prediction, an Evidently drift check over that log, and two
+Airflow DAGs that close the loop from "traffic looks wrong" back to "a new
+challenger was trained, scored, and accepted or refused."
 
-The serving model is a MobileNetV3-Large trained on hard labels — 4.27M
-parameters once the 1000-class head is replaced with a 51-class one, small enough
-that CPU inference is fine for single-image requests.
-`@champion` at the time of writing is registry **v10**, holdout accuracy
-**0.9201**, produced by a `retrain_coin_clf` run (120 epochs, batch 128) rather
-than by hand. It is resolved by alias at runtime, never baked into the image —
-`make champion` prints the current one. The pipeline has also *declined* a
-promotion: v11 scored 0.9150 on the same holdout and the gate held it, which is
-the behaviour the `--margin 0.005` exists for.
+The coins are interchangeable. The pipeline is the point.
 
-## Model history
+## Architecture
 
-These are the **notebook-era** numbers, kept because they are the record of what
-was tried. They are **not comparable to the registry's accuracies**: they predate
-the duplicate/label-conflict cleanup (`clean_duplicates.py`, 4,342 files
-quarantined) and the single-holdout carve (`splits.py`), and the ad-hoc splits
-they were scored on leaked — one such raw-tree 80/20 draw overlapped the training
-set by 5,689 images (see `export.py`'s docstring), and the v6 teacher itself
-trained on contaminated data. Read the table as a ranking of approaches, not as
-accuracy anyone should quote today.
+```mermaid
+flowchart LR
+    POOL["future pool<br/>11,559 withheld<br/>5,000 per release"]
+    HOLD[("frozen holdout — 11,559<br/>one definition, hash-verified")]
 
-| Notebook | Approach | Test acc (pre-cleanup) |
-|---|---|---|
-| `emp_model_v2.ipynb` | Frozen C-RADIO v4-H + linear head | 84.99% |
-| `emp_model_v3.ipynb` | + MLP/cosine head, mixup, class-balanced sampling, 5-head ensemble | 87.51% |
-| `emp_model_v3_TTA.ipynb` | + TTA feature extraction, 10-head ensemble | 88.82% |
-| `emp_model_v4.ipynb` | + ArcFace, patch tokens, hierarchical classifier (frozen backbone) | 88.69% |
-| `emp_model_v4.1.ipynb` | + fine-tuned C-RADIO backbone | 92.05% |
-| `emp_model_v5.ipynb` | Multi-stream (portrait/legend crops + DINOv2) — regressed | 91.73% |
-| `emp_model_v6.ipynb` | + per-stream projection, hard-pair sub-classifiers | **92.71% (best)** |
-| `emp_model_v7.ipynb` | Frozen DINOv2-only baseline (phase 1, no fine-tuning follow-up) | 85.78% |
-| `emp_model_knowledge_distilation.ipynb` | MobileNetV3-Large distilled from the v6 ensemble | 89.61% |
-| `emp_model_mobilenet_baseline.ipynb` | Same MobileNetV3, plain CE (no distillation) — comparison | 89.02% |
+    RETRAIN["<b>retrain_coin_clf</b> — Airflow<br/>release → validate → train<br/>→ evaluate → promote (margin 0.005)"]
+    REG[("MLflow registry<br/>@champion")]
+    API["FastAPI /predict<br/>loads @champion at startup"]
+    LOG[("prediction log<br/>one row per request")]
+    MON["<b>monitor_coin_clf</b> — Airflow<br/>check serving → drift check<br/>→ gate (cursor + breaker)"]
 
-Full write-up of what worked and what didn't is in `docs/improvement_or_not.md`
-(kept locally, not pushed).
+    POOL --> RETRAIN
+    RETRAIN -->|"alias moves, or holds"| REG
+    REG --> API --> LOG --> MON
+    MON -->|"drift ⇒ epochs=120, batch=256"| RETRAIN
+    HOLD -.->|"scores challenger and champion"| RETRAIN
+    HOLD -.->|"reference distribution"| MON
+    POOL -.->|"replay_traffic.py"| API
+```
 
-**The distillation path is retired.** The v6 teacher was trained on contaminated
-data, so the soft labels and everything distilled from them inherited it —
-`train.py` no longer imports `coin_clf.teacher` at all, and
-`verify_data_integrity.py` (section C5) checks that it can't come back.
-`coin_clf/teacher.py` survives only so the frozen v6 checkpoints can still be
-loaded for inspection. The live recipe is
-`notebooks/coin_mobilenet_hard_labels.ipynb` and its headless twin
-`train_hard_labels.py`: MobileNetV3-Large, class-balanced cross-entropy with
-label smoothing, 120 epochs, warmup + cosine decay, scored on the canonical
-11,559-image holdout.
+## Drift detection, demonstrated
+
+Two replay runs against champion v10 — 600 and 601 requests — scored against the
+champion's own predictions on the 11,559-image holdout. `normal` sends untouched
+file bytes from the unreleased future pool; `skewed` restricts to 5 classes,
+downsizes to 96px and converts to grayscale.
+
+| Signal | Normal | Skewed | Threshold | Method |
+|---|---|---|---|---|
+| `predicted_label` | 0.114 | **0.606** | 0.35 | Jensen-Shannon |
+| `confidence` | 0.053 | **0.812** | 0.25 | Wasserstein (normed) |
+| `width` | 0.058 | **0.870** | 0.25 | Wasserstein (normed) |
+| `height` | 0.059 | **0.876** | 0.25 | Wasserstein (normed) |
+| `mode` | 0.000 | **0.833** | 0.35 | Jensen-Shannon |
+
+`status=ok, drift_detected=false` for the normal run; `status=ok,
+drift_detected=true` on all three signals for the skewed one. Both runs saw only
+v10 rows — 0 excluded for a version mismatch. The machine-readable verdicts the
+DAG branches on are tracked: [normal](docs/drift_verdict_normal.json),
+[skewed](docs/drift_verdict_skewed.json).
+
+Two results worth more than the pass/fail:
+
+* **Normal traffic's mean confidence was 0.786; the reference's was 0.780.** That
+  is the holdout-as-reference choice validating itself empirically — unseen
+  production-shaped images score where the holdout scores, which is exactly why
+  the reference is not the training split (the champion trained on that for 120
+  epochs, so its confidence there is memorization-inflated and day-one traffic
+  would look like drift).
+* **The skewed batch contained 5 true classes but drew 16 distinct predictions.**
+  Degradation doesn't just shift mass onto the right 5 labels — it pushes the
+  model into confusions it never makes on clean inputs. The red bars below are
+  the degraded batch; the grey is the reference across all 51 classes.
+
+![Evidently drift report — predicted_label, skewed replay](docs/img/drift_skewed_predicted_label.png)
+
+## Quickstart — the whole loop in five commands
+
+```bash
+make mlflow                                     # 1. tracking server + registry (terminal 1)
+make build && make serve                        # 2. serving container, loads @champion (terminal 2)
+PYTHONPATH=src python3 replay_traffic.py --mode skewed   # 3. 600 degraded requests
+make drift                                      # 4. score them against the champion's reference
+xdg-open outputs/monitoring/drift_report_*.html # 5. read the verdict
+```
+
+Swap `--mode skewed` for `--mode normal` to see the other column of the table
+above. `make champion` prints the version currently aliased, and
+`make health` shows what the container is actually serving.
+
+## Serving
+
+`app/main.py` loads the model from the MLflow registry —
+`models:/coin-classifier@champion`, the full `nn.Module`, not a state dict — in a
+FastAPI **lifespan** (startup), not at import. That is what lets the module be
+imported with no registry reachable, which is how the tests inject a fake bundle
+through `app.dependency_overrides` and how CI's `--network none` import smoke test
+works.
+
+- `GET /health` — `status`, `device`, `num_classes`, `model_name`, `model_version`
+- `POST /predict?topk=N` — multipart image upload → `{model_version, predictions: [{label, probability}]}`
+  - optional `X-Traffic-Source` header: a monitoring tag (the replay script sets
+    it to separate a normal from a deliberately skewed batch). It changes nothing
+    about the prediction, only how the logged row is grouped later.
+
+Preprocessing is `coin_clf.transforms.val_transform`, the same object training
+uses: `Resize(256) -> CenterCrop(224) -> ImageNet normalize`. Labels come from
+`app/coin_labels.json` (index → emperor name), overridable with `LABELS_PATH`.
+
+Every request writes one row — version, label, confidence, width/height/mode,
+latency, source — to the SQLite prediction log (`coin_clf.prediction_log`). That
+log is the only thing observing this model in production and the sole input to the
+drift check. It is strictly an observer: `log()` never raises, `/predict` wraps it
+anyway, and it is the last thing the endpoint does. Image metadata is read from
+the upload **before** `.convert("RGB")`, or every row would report `mode="RGB"`
+forever and the mode drift signal would be permanently dead.
+
+Configuration, all environment variables:
+`MLFLOW_TRACKING_URI=http://127.0.0.1:5000`, `MODEL_NAME=coin-classifier`,
+`MODEL_ALIAS=champion`, `LABELS_PATH=app/coin_labels.json`,
+`PREDICTION_LOG_PATH=<repo>/outputs/monitoring/predictions.db`.
+
+The container needs the tracking server (for the alias) and its artifact store
+(for the weights), so `make serve` runs it on the host network with `~/.aws`
+mounted read-only and the prediction-log directory bind-mounted — without that
+mount the log dies with the `--rm` container and the host-side drift check has
+nothing to read.
+
+<details>
+<summary>The equivalent raw <code>docker run</code></summary>
+
+```bash
+docker run --rm --network host \
+  -v ~/.aws:/root/.aws:ro \
+  -v "$PWD/outputs/monitoring:/srv/outputs/monitoring" \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  -e PREDICTION_LOG_PATH=/srv/outputs/monitoring/predictions.db \
+  coin-classifier:latest
+```
+
+</details>
+
+The image is CPU-only (`python:3.10-slim` + CPU torch/torchvision wheels): the
+model is 4.27M parameters with the 51-class head, so single-image inference does
+not need a GPU. For GPU serving, swap the base image for an `nvidia/cuda` runtime
+and install the `cu121` wheels in `serve.Dockerfile`.
+
+To run it without Docker, you need Python 3.10 with `torch`, `torchvision`, the
+packages in `requirements-serve.txt`, and a reachable tracking server:
+
+```bash
+pip install -r requirements-serve.txt && pip install -e . --no-deps
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
 ## Dataset and its boundaries
 
@@ -96,91 +184,8 @@ Three rules the code enforces rather than documents:
   deleted, and there is a test plus an integrity check asserting they stay deleted.
 * **Disjointness by content hash, not filename.** `active_split` re-hashes both
   sides and refuses to return if any training image is byte-identical to a
-  holdout image.
-
-## Serving
-
-`app/main.py` is a FastAPI app. It loads the model from the MLflow registry —
-`models:/coin-classifier@champion`, the full `nn.Module`, not a state dict — in a
-FastAPI **lifespan** (startup), not at import. That is what lets the module be
-imported with no registry reachable, which is how the tests inject a fake bundle
-through `app.dependency_overrides` and how CI's `--network none` import smoke test
-works.
-
-- `GET /health` — `status`, `device`, `num_classes`, `model_name`, `model_version`
-- `POST /predict?topk=N` — multipart image upload → `{model_version, predictions: [{label, probability}]}`
-  - optional `X-Traffic-Source` header: a monitoring tag (the replay script sets
-    it to separate a normal from a deliberately skewed batch). It changes nothing
-    about the prediction, only how the logged row is grouped later.
-
-Preprocessing is `coin_clf.transforms.val_transform`, the same object training
-uses: `Resize(256) -> CenterCrop(224) -> ImageNet normalize`. Labels come from
-`app/coin_labels.json` (index → emperor name), overridable with `LABELS_PATH`.
-
-Every request writes one row — version, label, confidence, width/height/mode,
-latency, source — to the SQLite prediction log (`coin_clf.prediction_log`). That
-log is the only thing observing this model in production and the sole input to the
-drift check. It is strictly an observer: `log()` never raises, `/predict` wraps it
-anyway, and it is the last thing the endpoint does. Image metadata is read from
-the upload **before** `.convert("RGB")`, or every row would report `mode="RGB"`
-forever and the mode drift signal would be permanently dead.
-
-Configuration (all environment variables, with these defaults):
-`MLFLOW_TRACKING_URI=http://127.0.0.1:5000`, `MODEL_NAME=coin-classifier`,
-`MODEL_ALIAS=champion`, `LABELS_PATH=app/coin_labels.json`,
-`PREDICTION_LOG_PATH=<repo>/outputs/monitoring/predictions.db`.
-
-### Run it
-
-The container needs the tracking server (for the alias) and its artifact store
-(for the weights), so `make serve` runs it on the host network with `~/.aws`
-mounted read-only and the prediction-log directory bind-mounted — without that
-mount the log dies with the `--rm` container and the host-side drift check has
-nothing to read.
-
-```bash
-make mlflow          # terminal 1: tracking server, SQLite backend + S3 artifacts
-make build           # docker build -f serve.Dockerfile -t coin-classifier:latest .
-make serve           # terminal 2: the container, wired to both
-make health          # curl :8000/health
-```
-
-```bash
-curl -X POST "http://localhost:8000/predict?topk=3" \
-  -F "file=@/path/to/coin.jpg;type=image/jpeg"
-```
-
-The equivalent raw `docker run`, if you'd rather not use the Makefile:
-
-```bash
-docker run --rm --network host \
-  -v ~/.aws:/root/.aws:ro \
-  -v "$PWD/outputs/monitoring:/srv/outputs/monitoring" \
-  -e AWS_DEFAULT_REGION=us-east-1 \
-  -e PREDICTION_LOG_PATH=/srv/outputs/monitoring/predictions.db \
-  coin-classifier:latest
-```
-
-The image is CPU-only (`python:3.10-slim` + CPU torch/torchvision wheels) for
-portability — inference on this model size is fast enough without a GPU. For GPU
-serving, swap the base image for an `nvidia/cuda` runtime and install the `cu121`
-torch wheels in `serve.Dockerfile`. `.dockerignore` is an allowlist, not a
-denylist: it excludes everything and re-includes exactly the four paths the
-Dockerfile copies. The denylist it replaced had fallen behind the repo and was
-streaming a 50 GB context (the DVC cache, `weights/`, the Airflow venv) to build
-a ~1 GB image; under an allowlist a new large directory is ignored by default and
-a new `COPY` that needs something has to say so.
-
-### Run locally without Docker
-
-Requires Python 3.10 with `torch`, `torchvision`, and the packages in
-`requirements-serve.txt`, plus a reachable tracking server:
-
-```bash
-pip install -r requirements-serve.txt
-pip install -e . --no-deps
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
+  holdout image. The same physical coin uploaded twice under two filenames is a
+  leak that index bookkeeping cannot see.
 
 ## Retraining pipeline
 
@@ -200,11 +205,10 @@ Airflow makes, not a near-miss. Airflow's own process never imports torch.
 * **release_batch** — pops the next 5,000-image future-pool batch, appends it to
   `data/active_train.txt`, writes the batch's `(path,label)` rows for validation.
   A drained pool is a hard error, not a "bad batch".
-* **validate** — `python -m coin_clf.validate_batch`: readable (a real decode, not
-  a header parse), RGB mode, minimum dimensions, known label, class balance
-  (no class over 50% of a batch), no intra-batch duplicates, no leakage against
-  the reference set — by SHA-256 over bytes, the same hash `clean_duplicates.py`
-  uses. It reports a verdict; it never raises for a bad image.
+* **validate** — `python -m coin_clf.validate_batch`: readable (a real decode —
+  see the engineering notes), RGB mode, minimum dimensions, known label, class
+  balance (no class over 50% of a batch), no intra-batch duplicates, no leakage
+  against the reference set. It reports a verdict; it never raises for a bad image.
 * **gate_on_validation** — short-circuits train/evaluate/promote on an invalid
   batch. The DAG run stays **green**: a rejected batch is a normal outcome
   recorded in `report.json`, not a pipeline failure.
@@ -220,6 +224,9 @@ Airflow makes, not a near-miss. Airflow's own process never imports torch.
   number), is idempotent, bootstraps when there is no champion, and holds
   fail-safe if the champion cannot be scored. A HOLD is logged, not raised.
 
+The gate has actually refused: v10 (0.9201) is champion, and v11 scored 0.9150 on
+the same holdout and was held. Both were produced by DAG runs, not by hand.
+
 ## Monitoring loop
 
 `dags/monitor_coin_clf.py` — the closed loop.
@@ -233,16 +240,13 @@ check_serving_version → read_state → drift_check → gate_on_drift → trigg
 * **drift_check** runs `drift_report.py` over the prediction log since the state
   cursor. The reference is **the champion's own predictions on the holdout**, not
   the training labels — comparing predictions to labels would bake the model's
-  ~8% error rate into the baseline, and labels carry no confidence at all. It is
-  cached per champion version, and production rows are filtered to that version,
-  so a v7-vs-v6 comparison can't manufacture drift. Three signals —
-  `predicted_class`, `confidence`, and `image_metadata` (width/height/mode) —
-  scored with Jensen-Shannon at 0.35 on the categorical columns and normalized
-  Wasserstein at 0.25 on the numeric ones. Those thresholds were *measured*
-  against a simulated null at n=500 rather than defaulted (the obvious 0.1 would
-  fire on every normal batch); the confidence one is marked provisional in the
-  source because it has no measured null behind it yet. Output: an Evidently HTML
-  report plus a JSON verdict.
+  ~8% error rate into the baseline as a permanent non-zero floor, and labels carry
+  no confidence at all. It is cached per champion version, and production rows are
+  filtered to that version, so a v11-vs-v10 comparison can't manufacture drift.
+  Thresholds were *measured* against a simulated null at n=500 rather than
+  defaulted — the obvious 0.1 would fire on every normal batch — and the
+  confidence one is marked provisional in the source because it has no measured
+  null behind it yet.
 * **gate_on_drift** triggers only on `status == "ok" AND drift_detected`.
   `insufficient_data` (under 500 rows), `no_data` and `no_reference` all mean
   "couldn't tell", which is not "no drift" and is certainly not grounds for a
@@ -258,14 +262,68 @@ verdict was actually rendered, so the same rows can never re-fire) and a
 promotion means retraining is not the fix — drift keeps being reported, but the
 trigger stops).
 
-There is no real traffic to this model, so `replay_traffic.py` simulates it over
-HTTP against the running container: `normal` mode sends untouched file bytes from
-the *unreleased* future pool (unseen by the champion, and the calibration run for
-the provisional confidence threshold), `skewed` mode restricts classes, downsizes
-and grayscales. Requests go over HTTP rather than through in-process inference on
-purpose — the point is to exercise the real serving path, decode and log write
-included. It is read-only with respect to pipeline state: it reads the cursor,
-never advances it, and never appends to `active_train.txt`.
+`replay_traffic.py` is the traffic source. Requests go over HTTP against the
+running container rather than through in-process inference on purpose: the point
+is to exercise the real serving path, decode and log write included. It is
+read-only with respect to pipeline state — it reads the future-pool cursor, never
+advances it, and never appends to `active_train.txt`.
+
+## Engineering notes
+
+Three things that were wrong and what fixing them changed.
+
+**A "readable" check that passed unreadable files.** The retraining gate derived
+`readable` from PIL's `verify()`, which validates the JPEG header and stops. A
+file truncated mid-scan keeps an intact header: it opens, reports its true width,
+height and mode, passes every check, enters the training set, and raises `OSError`
+the first time a DataLoader touches it mid-epoch — the guard succeeding on exactly
+the case it exists to catch. `readable` is now a full decode
+(`image_meta.decodes`) while metadata stays a header parse, because serving
+decodes each upload anyway and must not pay twice. Cost measured, not assumed:
+0.2ms/image, ~2.2s for a 5,000-image batch inside a task that already runs for
+minutes. The regression test writes a *noise* image, because a flat-colour JPEG is
+~693 bytes and mostly header — truncating it destroys the header, every reader
+rejects it, and the test would pass against the old code and prove nothing.
+
+**A duplicated constant that manufactured a leak.** `verify_data_integrity.py`
+kept its own copy of the DAG's future-pool batch size. The copy went stale at 200
+against the DAG's 5,000, and the resulting arithmetic about which images had been
+released reported **9,600 phantom leakage collisions** — a data-integrity checker
+confidently crying leak. Correcting the number would have fixed the run and left
+the mechanism: two constants that must agree, in files nobody edits together. So
+the copy was deleted instead. The DAG's `BATCH_SIZE` is now the single
+declaration, read by AST (importing it would pull in airflow, which the test
+environment deliberately lacks). The test that matters doesn't check the value —
+it fails if the duplication comes back.
+
+**A `.dockerignore` that was a standing bug.** It listed what to exclude, and it
+fell behind the repo: written before the Airflow venv, the 44 GB DVC cache and
+`weights/`, so `docker build` streamed a 50 GB context to produce a ~1 GB image.
+A denylist here is wrong again the next time anyone adds a big directory, and
+nothing fails loudly when it does. It is now an allowlist — exclude everything,
+re-include exactly the four paths the Dockerfile copies. A new large directory is
+ignored by default, and a new `COPY` that needs something has to say so or the
+build fails loudly.
+
+## Known limitations
+
+**The serving container resolves `@champion` once, at startup.** After a
+promotion it keeps serving and *logging* the old version until someone restarts
+it, and monitoring goes blind in the meantime — the drift check filters
+production rows to the current champion, so it finds nothing to compare. It fails
+safe (no spurious trigger) and it fails visibly (`check_serving_version` is the
+monitoring DAG's first task and fails the run), but the real fix is a reload
+endpoint or a rolling restart on promotion. Deliberately deferred, not overlooked.
+
+**Drift and retraining are not causally connected.** The monitor detects degraded
+*traffic*; the retrain ingests clean *future-pool* images and does nothing about
+the degradation that fired it. In a production system a labeling pipeline sits
+between the two — the drifted images get labels, join the training set, and the
+holdout rolls forward with the distribution instead of staying frozen. This repo
+has both ends and no middle, because there are no production labels to build the
+middle out of. The frozen holdout is the right call for *this* system (it makes
+v10 and v11 comparable at all) and the wrong one for a system whose input
+distribution genuinely moves.
 
 ## Layout
 
@@ -280,17 +338,15 @@ which is also how the Makefile runs them, so a run reproduced by hand is the run
 src/coin_clf/  the shared library — model, transforms, data/split access, labels, hashing,
                image metadata, batch validation, prediction log, v6 teacher (load-only)
 app/           FastAPI serving app (main.py, coin_labels.json)
-dags/          Airflow DAGs — retrain_coin_clf (release → validate → train → evaluate →
-               promote) and monitor_coin_clf (drift → conditional retrain trigger)
+dags/          Airflow DAGs — retrain_coin_clf and monitor_coin_clf
 *.py at root   the pipeline CLIs — see "Root scripts" below
 tests/         the whole pytest suite, plus fixtures/make_tree.py (a ~60-image stand-in
                for the real tree, so verify_data_integrity.py can be exercised in CI)
 scripts/       one-off utilities (seed_champion.py)
-notebooks/     archived model-development notebooks (emp_model_v2..v7, distillation, the live
-               hard-labels recipe, gradcam, predict, ...) — history, not maintained code;
-               excluded from ruff and pytest
-docs/          tracked: folders.txt, ProjectBook.docx.pdf, verify_data_integrity_run.txt
-               (the full integrity run over the real tree)
+notebooks/     archived model-development notebooks — history, not maintained code;
+               excluded from ruff and pytest. They use absolute paths, because VS Code
+               sets a notebook's cwd to its own directory
+docs/          reference material + the tracked integrity run; working notes are local-only
 .github/       CI workflow — the merge gate
 makefile       control panel: mlflow, airflow, build, serve, train, retrain, drift, health
 .airflow_env.sh  AIRFLOW_HOME / DAGs folder / port + the airflow venv, sourced by `make airflow`
@@ -299,7 +355,7 @@ makefile       control panel: mlflow, airflow, build, serve, train, retrain, dri
 Generated or too large to track — gitignored, except where noted:
 
 ```
-data/          the dataset itself is gitignored and DVC-tracked (FOR_TRAINNING/, archives/,
+data/          the dataset is gitignored and DVC-tracked (FOR_TRAINNING/, archives/,
                quarantine/), but the small files that DEFINE the splits are tracked:
                splits_manifest.json, clean_files.txt, active_train.txt,
                future_pool_cursor.json, drop_log.csv
@@ -307,27 +363,13 @@ weights/       all .pth / .onnx checkpoints
 mlflow/        local MLflow tracking store (mlflow.db)
 outputs/       generated artifacts — monitoring/ (prediction log, drift reports, verdicts,
                monitor_state.json), dag_runs/, gradcam_out/, misclassified/
-docs/          working notes (improvement_or_not.md, notebook_summary.md, ...) are local-only
 misc/          loose non-project images
 .venv-airflow/ the Airflow interpreter — deliberately separate from the torch/mlflow one
 ```
 
-Every notebook that is part of this repo's history uses **absolute paths**
-(`/home/david/coin/FOR_TRAINNING`, `/home/david/coin/weights/emp_model_*.pth`)
-rather than paths relative to the notebook's own location — this matters because
-VS Code's Jupyter extension sets a notebook's `cwd` to wherever the `.ipynb` file
-lives, so a bare relative filename would silently break the moment the notebook
-moved into `notebooks/`. All checkpoint load/save cells and `predict.ipynb`'s
-`prediction_result.png` output were updated to absolute paths as part of that
-move. (Two exceptions: `CoinClassifierDontEdit.ipynb` and `emp_model.ipynb` are
-the original Colab notebooks and still carry `/content/drive` paths; and
-`coin_mobilenet_hard_labels.ipynb`, the current recipe, resolves the repo root
-from `cwd` on purpose so it imports the same `train.py` seams the CLI does.)
-
-Three compatibility symlinks at the repo root keep the absolute paths working:
-`FOR_TRAINNING` → `data/FOR_TRAINNING`, `misclassified` → `outputs/misclassified`,
-and `prediction_result.png` → `outputs/prediction_result.png`. The first is not
-decoration — `verify_data_integrity.py` (check B1c) asserts the alias discovers
+Three compatibility symlinks at the repo root (`FOR_TRAINNING`, `misclassified`,
+`prediction_result.png`) keep the notebooks' absolute paths working. The first is
+not decoration: `verify_data_integrity.py` (check B1c) asserts the alias discovers
 the same file set as `data/FOR_TRAINNING`, so a stale symlink is caught rather
 than silently trained through.
 
@@ -345,7 +387,7 @@ The retraining and monitoring pipeline, as individually runnable CLIs. Grouped b
 **Train → evaluate → promote** — what the `retrain_coin_clf` DAG shells out to, in order.
 
 - `release_batch.py` — pops the next future-pool batch and folds it into `data/active_train.txt`.
-- `train_hard_labels.py` — the headless twin of `coin_mobilenet_hard_labels.ipynb`, the recipe that earned registry v6; the DAG's training step, and what produced the current champion. Defaults: 120 epochs, batch 128 (a monitor-triggered run passes 256).
+- `train_hard_labels.py` — the headless twin of `coin_mobilenet_hard_labels.ipynb`; the DAG's training step, and what produced the current champion. Defaults: 120 epochs, batch 128 (a monitor-triggered run passes 256).
 - `train.py` — the general-purpose training CLI (`make train`). Defaults: 60 epochs, batch 128.
 - `evaluate.py` — scores a registered version on the frozen holdout; `promote.py` re-uses `evaluate_version` so both sides of the gate are scored on the same split.
 - `promote.py` — the promotion gate: moves `@champion` only if the challenger clears the margin.
@@ -360,7 +402,7 @@ The retraining and monitoring pipeline, as individually runnable CLIs. Grouped b
 **Elsewhere**
 
 - `export.py` — ONNX export + int8 quantization, verified against the same frozen holdout.
-- `scripts/seed_champion.py` — registers a checkpoint as the `@champion` model in the MLflow registry. This is how v1 got there (from `emp_model_mobilenet_baseline.pth`); every version since was registered by a training run.
+- `scripts/seed_champion.py` — registers a checkpoint as the `@champion` model in the MLflow registry. This is how v1 got there; every version since was registered by a training run.
 
 ## Make targets
 
@@ -376,7 +418,7 @@ The retraining and monitoring pipeline, as individually runnable CLIs. Grouped b
 | `make monitoring-install` | evidently, for the offline drift check (deliberately not in the serving image) |
 | `make drift` | run the drift check → HTML report + verdict in `outputs/monitoring` |
 
-## Tests
+## Tests and CI
 
 ```bash
 pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
@@ -389,8 +431,8 @@ Install order matters: `pyproject.toml` declares torch/torchvision as
 dependencies, so a plain `pip install -e .` re-resolves them from PyPI and drags
 in ~2.5 GB of CUDA wheels no test can use. `--no-deps` keeps the CPU wheels.
 
-159 tests, ~35s, all under `tests/`, with no dataset, no GPU, no MLflow server and
-no AWS credentials — the same conditions the CI runner has.
+**159 tests, ~35s**, all under `tests/`, with no dataset, no GPU, no MLflow server
+and no AWS credentials — the same conditions the CI runner has.
 `.github/workflows/ci.yml` runs that command on every PR alongside `ruff check .`
 and `mypy src/coin_clf` (scoped to the shared library; the root scripts still
 report 11 errors, widening it is a follow-up), asserts no `nvidia-*` wheel slipped
@@ -402,9 +444,9 @@ Anything that would need the real 57,792-image tree or CUDA gets the `needs_data
 / `needs_gpu` marker instead of being deleted; nothing carries either one today
 (`--strict-markers` makes a typo'd marker an error rather than a silent no-op).
 `verify_data_integrity.py` is the one check that cannot run in CI — it re-hashes
-the whole tree — so `tests/test_verify_data_integrity.py` runs it against
-`tests/fixtures/make_tree.py`'s ~60-image stand-in, injecting one specific fault
-per test and asserting the check that should notice actually names it.
+the whole tree — so `tests/test_verify_data_integrity.py` runs it against a
+~60-image stand-in, injecting one specific fault per test and asserting the check
+that should notice actually names it.
 
 ## Data & weights
 
@@ -415,3 +457,39 @@ pointer, and the remote is `s3://davids-mlops-artifacts-8412/dvc` — the same
 bucket MLflow writes model artifacts to. What git tracks is source, notebooks,
 this README, and the small JSON/TXT/CSV files under `data/` that define the split
 boundaries and record what the cleanup dropped.
+
+## Model history
+
+Before any of the above existed, the project was a series of notebooks iterating
+on feature extraction, head architecture and ensembling. These numbers are the
+record of what was tried. They are **not comparable to the registry's
+accuracies**: they predate the duplicate/label-conflict cleanup and the
+single-holdout carve, and the ad-hoc splits they were scored on leaked — one such
+raw-tree 80/20 draw overlapped the training set by 5,689 images (see `export.py`).
+Read the table as a ranking of approaches, not as accuracy anyone should quote.
+
+| Notebook | Approach | Test acc (pre-cleanup) |
+|---|---|---|
+| `emp_model_v2.ipynb` | Frozen C-RADIO v4-H + linear head | 84.99% |
+| `emp_model_v3.ipynb` | + MLP/cosine head, mixup, class-balanced sampling, 5-head ensemble | 87.51% |
+| `emp_model_v3_TTA.ipynb` | + TTA feature extraction, 10-head ensemble | 88.82% |
+| `emp_model_v4.ipynb` | + ArcFace, patch tokens, hierarchical classifier (frozen backbone) | 88.69% |
+| `emp_model_v4.1.ipynb` | + fine-tuned C-RADIO backbone | 92.05% |
+| `emp_model_v5.ipynb` | Multi-stream (portrait/legend crops + DINOv2) — regressed | 91.73% |
+| `emp_model_v6.ipynb` | + per-stream projection, hard-pair sub-classifiers | **92.71% (best)** |
+| `emp_model_v7.ipynb` | Frozen DINOv2-only baseline (phase 1, no fine-tuning follow-up) | 85.78% |
+| `emp_model_knowledge_distilation.ipynb` | MobileNetV3-Large distilled from the v6 ensemble | 89.61% |
+| `emp_model_mobilenet_baseline.ipynb` | Same MobileNetV3, plain CE (no distillation) — comparison | 89.02% |
+
+**The distillation path is retired.** The v6 teacher trained on contaminated data,
+so the soft labels and everything distilled from them inherited it — `train.py` no
+longer imports `coin_clf.teacher`, and `verify_data_integrity.py` (section C5)
+checks that it cannot come back. The live recipe is
+`notebooks/coin_mobilenet_hard_labels.ipynb` and its headless twin
+`train_hard_labels.py`: MobileNetV3-Large, class-balanced cross-entropy with label
+smoothing, 120 epochs, warmup + cosine decay, scored on the canonical
+11,559-image holdout.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

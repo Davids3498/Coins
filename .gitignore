@@ -15,6 +15,10 @@ prediction_result.png
 *.jpg
 *.jpeg
 *.png
+# ...except figures the README embeds. Tracked deliberately: a screenshot of a
+# generated Evidently report is evidence the drift check ran, and outputs/ itself
+# stays ignored, so the only way one reaches the repo is by being copied here.
+!docs/img/*.png
 
 # MLflow local tracking store
 mlflow.db
