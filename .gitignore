@@ -49,9 +49,19 @@ __pycache__/
 # OS
 .DS_Store
 
-# Docs — keep only README.md, working notes stay local
+# Docs — working notes stay local. The README was split into these seven reference pages
+# (see "Repo map"), so each is un-ignored BY NAME rather than with a blanket !docs/*.md:
+# the un-listed files in docs/ are scratch (v4_deep_dive, program, notebook_summary,
+# improvement_or_not) and should keep staying out of the repo.
 *.md
 !README.md
+!docs/dataset.md
+!docs/pipeline.md
+!docs/serving.md
+!docs/cloud-deploy.md
+!docs/engineering-notes.md
+!docs/development.md
+!docs/model-history.md
 
 # makefile is tracked: it carries the serving container's outputs/monitoring volume mount,
 # without which /predict logs into a --rm container and the drift check has nothing to read.
